@@ -26,6 +26,7 @@
 10. [群聊操作 / Group Chat](#10-群聊操作专题--group-chat-operations)
 10.5 [通讯录标签 / Contact Labels](#105-通讯录标签--contact-labels)
 10.6 [右键转发 / Forward a Message](#106-右键转发--forward-a-message)
+10.7 [改联系人备注 / Set a Contact Remark](#107-改联系人备注--set-a-contact-remark)
 11. [常见问题与排错 / FAQ](#11-常见问题与排错--faq--troubleshooting)
 12. [API 速查表 / Quick Reference](#12-api-速查表--api-quick-reference)
 
@@ -98,8 +99,10 @@ python -m wechatauto messages 文件传输助手 --limit 20 [--type image] [--js
 python -m wechatauto export 文件传输助手 --limit 500 [--out history.txt]
 python -m wechatauto images 某群 --limit 50 [--out D:\img] [--tier best] [--original]
 python -m wechatauto send 你好 --to 文件传输助手 [--verify] [--file x.pdf | --image x.png]
+                           [--verify-interval 1] [--verify-timeout 8]
 python -m wechatauto listen 某群 [--all] [--interval 1]
 python -m wechatauto moments [--limit 10] [--me] [--json]
+python -m wechatauto 备注 小明 --to 新备注          # 改联系人备注（--probe 只探路，--clear 清空）
 ```
 
 它替用户吸收的三件事，正是新手最容易卡住的地方：
@@ -846,6 +849,14 @@ wx.SendToLabel("周五校庆放假", "同事", limit=1)        # 真发，先试
 wx.ProbeLabels(dump_dir="label_probe")                # 只导航不写，报断在哪一步
 ```
 
+改备注（走「通讯录 → 点开联系人 → 资料页『更多』→『设置备注和标签』」，锚点与踩过的坑见 10.7）：
+
+```python
+wx.RenameMember("小明", "高中同学")        # 改完备注后，通讯录里显示的就是新备注
+wx.RenameMember("小明", "", allow_empty=True)   # 清空备注（必须显式允许，免得误抹）
+wx.ProbeRemark("小明")                    # 只走一遍并打开编辑窗，随即关掉（不写）
+```
+
 一条命令版（中文子命令同样认）：
 
 ```bash
@@ -1032,6 +1043,50 @@ wechatauto forward --label 同学 --chat 文件传输助手 --match "测试文�
 
 ---
 
+### 10.7 改联系人备注 / Set a contact remark
+
+入口不在聊天页也不在通讯录管理窗，而是：**通讯录 → 点开某个联系人 → 资料页里
+昵称右边那颗「更多」→「设置备注和标签」**。实现在 `wechatauto/remark.py`
+（`RemarkOps`，继承 `LabelOps` 复用抬窗 / 落点归属校验 / 小窗枚举那套脚手架）。
+
+实测锚点（4.1.15.13，2026-10-16/17 逐层探过）：
+
+| 步骤 | 锚点 |
+|---|---|
+| 联系人行 | `mmui::ContactsCellItemView`，`Name` 就是显示名（备注优先于昵称） |
+| 资料页 | `mmui::ProfileView`；入口是其中 `mmui::XButton`（`Name='更多'`） |
+| 菜单 | `mmui::XMenuView`（`Name='设置备注和标签'`，aid=`XMenuItem`） |
+| 编辑窗 | 独立顶层窗，标题就是「设置备注和标签」（类名 `Qt51514QWindowToolSaveBits`） |
+| 输入框 | `mmui::XLineEdit`（`Name='修改备注名'`）；父 `mmui::XLineField` 的 Name 是当前备注 |
+| 按钮 | `mmui::XOutlineButton`：`完成` / `取消` |
+
+五个踩过的坑（每个都吃过一次）：
+
+1. **资料页的「更多」必须限定在 `ProfileView` 子树里找**——主窗导航栏底部也有一颗
+   `mmui::XButton`（`Name='更多'`），先撞上它就会点到导航栏去。
+2. **菜单挂在主窗树里，屏幕归属却是独立小窗**：直接按主窗句柄点会被落点校验拒
+   （`occluded：落点被窗口 …盖着`）。`_click_owned()` 先算控件矩形中点归属哪个窗口，
+   再拿那个句柄去点。
+3. **左边联系人列表是虚拟化的**（一屏十几行），要找的人通常不在首屏 → `find_contact_row`
+   先倒回顶部再一屏屏往下滚（一格滚轮实测只走 1~2 行，所以每轮 8 格、最多 40 轮）。
+   **不要用搜索框那条路**：搜出来点结果是「打开会话」而不是资料页（点完
+   `chat_message_list` 里出历史消息），白点一下还改了用户当前会话。
+4. **「通讯录」tab 会记住上次停在谁的资料页上**：点它出来的可能就是资料页，左栏列表
+   根本不渲染 → 先点资料页里的「返回」退出来（那颗按钮在 `profile_view` 这层容器上，
+   **不在** `ProfileView` 子树里），再等左栏。
+5. **输入走「拿焦点 + 剪贴板 Ctrl+V」，贴完必须回读**：坐标点击会把微信前台打掉，
+   粘贴整个落空（和发送输入框同一个坑）。回读失败就报 `paste-mismatch`，不点完成。
+
+回读口径：改完按 **username** 查 `contact.db` 的 `remark` 字段（不是拿新备注当搜索键——
+清空那次新值就是空串，用它搜永远搜不到，实测踩过：界面上明明清掉了，报告却写「库里读不到」）。
+`RenameMember(who, "")` 必须显式 `allow_empty=True`，免得漏参数就把人家的备注抹了。
+
+> 状态：真机两轮完整回环已跑通（改「送你挖银子」→ 落库确认 → `--clear` 清空 → 落库确认为空），
+> 离线判据 `python tools/selftest.py remark`（14 项）钉住锚点 / 落点归属 / 粘贴回读 /
+> 清空语义 / 回读口径。改真人备注前请自己确认改的是谁。
+
+---
+
 ## 11. 常见问题与排错 / FAQ & Troubleshooting
 
 ### Q1: `RuntimeError: 数据库无可用密钥` / no usable DB key
@@ -1064,6 +1119,13 @@ wechatauto forward --label 同学 --chat 文件传输助手 --match "测试文�
 - 微信窗口需可见（不能锁屏/最小化到托盘）/ window must be visible
 - 锁屏或窗口不可响应时发送会安全失败
 - 换用 `verify=True` 获得回读确认
+- 「消息已操作发送，但数据库未确认（等了 8s）」这句里的 **8 秒和轮询间隔都可调**：
+  `WxParam.DB_VERIFY_INTERVAL`（默认 1.0 秒）与 `WxParam.DB_VERIFY_TIMEOUT`（默认 8.0 秒，
+  设 0 就只读一次）。微信写库是异步的，机器慢、会话多时一次读不到不等于没发出去；
+  反过来每读一次都要走一遍解密+查询，所以间隔不是越小越好。命令行上对应
+  `send / labels send / forward` 的 `--verify-interval` 与 `--verify-timeout`。
+  默认值就是这轮改动之前写死的那两个数（实测：上限 8 秒时读 9 次，改成 2.5 秒
+  间隔只读 5 次，上限设 0 就读 1 次）。
 
 ### Q5: 语音下载不到 / voice not downloading
 
@@ -1093,6 +1155,14 @@ wechatauto forward --label 同学 --chat 文件传输助手 --match "测试文�
 
 判据（一行）：看微信窗口的 ClassName —— `mmui::MainWindow` = 树在；
 `Qt51514QWindowIcon` = 树没建 / class is `Qt51514QWindowIcon` means no tree。
+
+想脱离库单独验/手动开关这棵树，用独立脚本 `tools/wake_uia.py`（只用标准库，
+校验控件树时才需要 `uiautomation`）：`--status` 只报告、`--off` 写回 0、默认激活、
+`--rva 0x...` 跳过扫描、`--cache FILE` 换缓存位置；它读写的是同一份
+`~/.wechatauto/gate_cache.json`。2026-10-10 六臂对照（每个臂换新进程查一次，排除
+UIA 客户端缓存）实测：**树只跟这个字节走**（写 1 ⇒ `mmui::MainWindow`，回 0 ⇒ 掉回
+`Qt51514QWindowIcon`，一秒内跟翻），系统「屏幕阅读器」标志开不开都不影响——所以库
+现在只在字节那条路走不通时才去碰它，那是全系统级开关，会让别的程序也去建无障碍树。
 
 扫不到可用窗口时，库现在会明确警告原因（每种原因一个进程只说一次，不刷屏）：
 

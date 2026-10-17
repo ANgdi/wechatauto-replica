@@ -17,7 +17,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.6.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
+> **Current version:** 1.2.7.0 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.53)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -217,6 +217,20 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.7.0 (2026-10-17)
+
+- **New: set a contact's remark — `wx.RenameMember("Bob", "high school")` / `wechatauto 备注 Bob --to "high school"`.** This is the first feature that writes to your account data, so three things are deliberate:
+  - The path is Contacts → open a contact → profile "More" → "Remark & Tags", reusing the same window/click scaffolding as the contact-label feature (`wechatauto/remark.py`, `RemarkOps` extends `LabelOps`) — lifted windows, click-ownership checks and independent-popup enumeration all shared.
+  - The result is confirmed by reading the `remark` column back **for that contact's username** out of `contact.db`; a failed read-back is reported as failure, never as success.
+  - Clearing a remark needs an explicit `--clear` / `allow_empty=True`, so a forgotten argument cannot wipe someone's remark. `wechatauto 备注 Bob --probe` walks the same path, opens the editor and closes it without writing anything — use it to find which step broke when WeChat's UI shifts.
+- **New: the post-send database read-back interval is configurable.** `WxParam.DB_VERIFY_INTERVAL` (default 1.0 s) and `WxParam.DB_VERIFY_TIMEOUT` (default 8.0 s; 0 = single read), with `--verify-interval` / `--verify-timeout` on `send`, `labels send` and `forward`. The defaults are exactly the two numbers that used to be hard-coded, so behaviour is unchanged. The failure text now states how long it waited (`数据库未确认（等了 8s）`).
+- **New: `tools/wake_uia.py` — activate or drop the UIA control tree without depending on this library.** `--status` only reports, `--off` flips the byte back, `--rva 0x…` skips the scan. It shares the same RVA cache file, so the scan cost is paid once.
+- **Internal: the Qt accessibility gate is its own module** (`wechatauto/accessibility.py`), with same-name forwarding from `uia_driver` kept so no caller changes. Two defects that were silently breaking hot activation are fixed:
+  - `_HAS_WIN32` and the `uiautomation` alias were left behind during the move and swallowed by an outer `except`, showing up as "found a WeChat window but could not locate Weixin.dll" and "N candidates did not materialize the mmui tree" — i.e. every activation rolled its own byte back.
+  - The screen-reader system flag used the wrong SPI constants (`0x0046/0x0047` are the keyboard-preference pair) **and** passed the value in the wrong argument; Windows rejected it with `FALSE` + err=87, so the flag had never actually been set. A six-arm fresh-process A/B showed the tree follows the gate byte alone, so the flag is now touched only when the byte path fails.
+- **New: WeChat 4.1.15.53 support** — gate RVA `0x0B3959D8` added to the version table (scanned and verified on a live client: writing it flips the tree to `mmui::MainWindow`, clearing it drops back to `Qt51514QWindowIcon`).
+- Verified: 561 offline checks + 98 label + 59 forward green; the remark path completed two full live round-trips (set → confirmed in the DB → clear → confirmed empty).
 
 ### v1.2.6.1 (2026-10-10)
 

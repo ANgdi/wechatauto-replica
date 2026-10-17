@@ -2021,14 +2021,11 @@ class WeChatGUI:
                 if sent:
                     if not verify:
                         return WxResponse.success(f'消息已发送：{text}', data={'content': text})
-                    if self._verify_sent(text, who, after=mark):
+                    if self._wait_landed(text, who, mark):
                         return WxResponse.success(f'消息已发送并确认：{text}', data={'content': text})
-                    wait_until = time.time() + 8
-                    while time.time() < wait_until:
-                        time.sleep(1.0)
-                        if self._verify_sent(text, who, after=mark):
-                            return WxResponse.success(f'消息已发送并确认：{text}', data={'content': text})
-                    return WxResponse.failure('消息已操作发送，但数据库未确认', data={'content': text})
+                    return WxResponse.failure(
+                        '消息已操作发送，但数据库未确认（等了 %gs）'
+                        % WxParam.DB_VERIFY_TIMEOUT, data={'content': text})
         if not self.ensure_visible():
             return WxResponse.failure('微信窗口不可见（可能锁屏/会话断开）')
         self._last_input_box = None
@@ -2062,15 +2059,11 @@ class WeChatGUI:
                 continue
             if not verify:
                 return WxResponse.success(f'消息已发送：{text}', data={'content': text})
-            if self._verify_sent(text, who, after=mark):
+            if self._wait_landed(text, who, mark):
                 return WxResponse.success(f'消息已发送并确认：{text}', data={'content': text})
-            # 可能已发送但 DB 异步落库，轮询确认，不重发避免重复
-            wait_until = time.time() + 8
-            while time.time() < wait_until:
-                time.sleep(1.0)
-                if self._verify_sent(text, who, after=mark):
-                    return WxResponse.success(f'消息已发送并确认：{text}', data={'content': text})
-            return WxResponse.failure('消息已操作发送，但数据库未确认', data={'content': text})
+            return WxResponse.failure(
+                '消息已操作发送，但数据库未确认（等了 %gs）'
+                % WxParam.DB_VERIFY_TIMEOUT, data={'content': text})
         return WxResponse.failure('发送失败：多次重试未完成（最后一次卡在：%s%s）'
                                   % (stuck,
                                      '' if uia is not None
@@ -2131,6 +2124,24 @@ class WeChatGUI:
         except Exception as e:
             _log_swallowed('发送水位读取', e)
         return None
+
+    def _wait_landed(self, text: str, who: Optional[str],
+                     after: Optional[dict] = None, mode: str = 'exact') -> bool:
+        """回读确认落库；一次没读到就按 ``WxParam.DB_VERIFY_INTERVAL`` 轮询到上限。
+
+        微信写库是异步的，「读到第一下没有」不等于「没发出去」。间隔和上限都是
+        可调项（默认 1 秒一次、最多 8 秒，就是原来写死的那两个数）；把上限设成
+        0 就退化成「只读一次」。每读一次都要走一遍解密+查询，所以间隔不是越小越好。
+        """
+        gap = max(0.01, float(WxParam.DB_VERIFY_INTERVAL))
+        until = time.time() + max(0.0, float(WxParam.DB_VERIFY_TIMEOUT))
+        while True:
+            if self._verify_sent(text, who, mode=mode, after=after):
+                return True
+            left = until - time.time()
+            if left <= 0:
+                return False
+            time.sleep(min(gap, left))
 
     def _verify_sent(self, text: str, who: Optional[str], mode: str = 'exact',
                      after: Optional[dict] = None) -> bool:

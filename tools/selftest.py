@@ -306,6 +306,81 @@ def t_verify() -> None:
     check("who 为空按自己的会话",
           bool(VStub([row("hi", 10)])._send_watermark(None)))
 
+    print("[verify] 落库回读的间隔可调（默认就是原来写死的 1 秒 / 8 秒）")
+    import wechatauto.guia as guia_mod
+    from wechatauto.param import WxParam
+
+    class FakeTime:
+        """假时钟：sleep 把时间推上去，这样轮询节奏能离线数清楚。"""
+
+        def __init__(self):
+            self.now, self.slept = 0.0, []
+
+        def time(self):
+            return self.now
+
+        def sleep(self, s):
+            self.slept.append(round(s, 4))
+            self.now += s
+
+    check("默认值 = 老代码写死的 1.0 秒 / 8.0 秒",
+          (WxParam.DB_VERIFY_INTERVAL, WxParam.DB_VERIFY_TIMEOUT) == (1.0, 8.0),
+          "%s / %s" % (WxParam.DB_VERIFY_INTERVAL, WxParam.DB_VERIFY_TIMEOUT))
+
+    old_time = guia_mod.time
+    old_params = (WxParam.DB_VERIFY_INTERVAL, WxParam.DB_VERIFY_TIMEOUT)
+    try:
+        def poll_stub(hit_at=3, always=False):
+            calls = []
+
+            class P(VStub):
+                _wait_landed = WeChatGUI._wait_landed
+
+                def _verify_sent(self, text, who, mode='exact', after=None):
+                    calls.append(1)
+                    return False if always else len(calls) >= hit_at
+            return P([]), calls
+
+        guia_mod.time = FakeTime()
+        g, calls = poll_stub(always=True)
+        check("默认节奏和写死时一致：9 次读取、8 次 1 秒",
+              g._wait_landed("x", "目标会话") is False and len(calls) == 9
+              and guia_mod.time.slept == [1.0] * 8, str(guia_mod.time.slept))
+
+        guia_mod.time = FakeTime()
+        g2, calls2 = poll_stub(hit_at=3)
+        check("前两次读不到不算失败，第三次落库了就返回成功",
+              g2._wait_landed("x", "目标会话") is True and len(calls2) == 3)
+
+        WxParam.DB_VERIFY_INTERVAL = 2.5
+        guia_mod.time = FakeTime()
+        g3, calls3 = poll_stub(always=True)
+        got3 = g3._wait_landed("x", "目标会话")
+        check("间隔调成 2.5 秒就按 2.5 睡，最后一次只补到上限（不超 8 秒）",
+              got3 is False and guia_mod.time.slept == [2.5, 2.5, 2.5, 0.5]
+              and len(calls3) == 5, str(guia_mod.time.slept))
+
+        WxParam.DB_VERIFY_TIMEOUT = 0
+        guia_mod.time = FakeTime()
+        g4, calls4 = poll_stub(always=True)
+        got4 = g4._wait_landed("x", "目标会话")
+        check("上限设 0 = 只读一次就判（不轮询）",
+              got4 is False and guia_mod.time.slept == [] and len(calls4) == 1,
+              str(calls4))
+
+        WxParam.DB_VERIFY_TIMEOUT, WxParam.DB_VERIFY_INTERVAL = 8.0, 0.0
+        guia_mod.time = FakeTime()
+        g5, calls5 = poll_stub(always=True)
+        got5 = g5._wait_landed("x", "目标会话")
+        s5 = guia_mod.time.slept
+        check("间隔给 0 也有下限兜着（只有最后一次补到上限），不会变成忙等",
+              got5 is False and len(s5) > 1 and min(s5[:-1]) >= 0.01
+              and round(sum(s5), 6) == 8.0,
+              "%d 次轮询，下限 %s" % (len(s5), min(s5[:-1])))
+    finally:
+        guia_mod.time = old_time
+        WxParam.DB_VERIFY_INTERVAL, WxParam.DB_VERIFY_TIMEOUT = old_params
+
 
 # ----------------------------------------------------------------------
 # 6. 拟人节奏（纯离线：时间被接管，不碰微信）
@@ -517,16 +592,21 @@ def _write_sink_functions():
 # ----------------------------------------------------------------------
 def t_gate() -> None:
     """``_rip_xrefs_to_rva`` 向量化后与逐字节实现等价；扫描失败/异常不得打断调用方。"""
+    import ast
+    import ctypes
+    import io
     import random
     import struct as st
     import tempfile
 
     import wechatauto.uia_driver as ud
-    from wechatauto.uia_driver import IMAGE_SCN_MEM_EXECUTE, WeChatUIA
+    import wechatauto.accessibility as acc
+    from wechatauto.accessibility import IMAGE_SCN_MEM_EXECUTE
+    from wechatauto.uia_driver import WeChatUIA
 
     EXEC = IMAGE_SCN_MEM_EXECUTE | 0x40000000      # +INITIALIZED_DATA
     WRITE = 0x80000000 | IMAGE_SCN_MEM_EXECUTE     # 可写 + 可执行：仍该参与匹配
-    _gate_entry = lambda p: ud._gate_cache().get(_dll_identity(p), {})
+    _gate_entry = lambda p: acc._gate_cache().get(_dll_identity(p), {})
 
     def build(n=4096, seed=7):
         """一段可执行 section 覆盖整个 buffer，尾部留 16 字节给边界用例。"""
@@ -610,14 +690,14 @@ def t_gate() -> None:
             sys.modules["numpy"] = saved_np
 
     print("[gate] 扫描失败要返回空序列，不是 None；结果按 DLL 身份落盘")
-    from wechatauto.uia_driver import _dll_identity
+    from wechatauto.accessibility import _dll_identity
 
     scan = WeChatUIA._scan_qaccessible_candidates
     with tempfile.TemporaryDirectory() as td:
         cache_file = os.path.join(td, "gate_cache.json")
-        old_file = ud.GATE_CACHE_FILE
-        old_verified = dict(ud._VERIFIED_GATE_RVA)
-        ud.GATE_CACHE_FILE, ud._GATE_CACHE = cache_file, None
+        old_file = acc.GATE_CACHE_FILE
+        old_verified = dict(acc._VERIFIED_GATE_RVA)
+        acc.GATE_CACHE_FILE, acc._GATE_CACHE = cache_file, None
         try:
             missing = os.path.join(td, "nope.dll")
             junk = os.path.join(td, "junk.dll")
@@ -637,39 +717,42 @@ def t_gate() -> None:
                       "%s" % _gate_entry(tiny))
 
             fake = os.path.join(td, "fake-9.9.9", "Weixin.dll")
-            ud._gate_cache_put(_dll_identity(fake), candidates=[0x1234, 0x5678])
+            acc._gate_cache_put(_dll_identity(fake), candidates=[0x1234, 0x5678])
             scan.cache_clear()
             check("盘上缓存命中即返回，不再读 198MB 文件（该路径根本不存在）",
                   scan(fake) == (0x1234, 0x5678))
-            ud._gate_cache_put(_dll_identity(fake), verified=0x9999)
-            ud._VERIFIED_GATE_RVA.clear()
+            acc._gate_cache_put(_dll_identity(fake), verified=0x9999)
+            acc._VERIFIED_GATE_RVA.clear()
             check("已验证 RVA 从盘上恢复并顶到候选序列首位",
                   WeChatUIA._qaccessible_candidate_rvas(fake)[0] == 0x9999)
             with open(cache_file, "w", encoding="utf-8") as f:
                 f.write("{ 坏掉的 json")
-            ud._GATE_CACHE = None
+            acc._GATE_CACHE = None
             scan.cache_clear()
             check("缓存文件损坏 → 不抛，按未命中重扫", scan(fake) == ())
         finally:
-            ud.GATE_CACHE_FILE, ud._GATE_CACHE = old_file, None
-            ud._VERIFIED_GATE_RVA.clear()
-            ud._VERIFIED_GATE_RVA.update(old_verified)
+            acc.GATE_CACHE_FILE, acc._GATE_CACHE = old_file, None
+            acc._VERIFIED_GATE_RVA.clear()
+            acc._VERIFIED_GATE_RVA.update(old_verified)
             scan.cache_clear()
 
     print("[gate] 热激活异常只降级，不打断发送")
 
     class Stub:
-        _set_screen_reader_flag = lambda self, on: None
+        """假 driver：只测 `_wake_accessibility` 的编排（试了哪些窗、标志何时开）。"""
         _wechat_hwnds = lambda self: [1, 2]
 
-        def __init__(self, boom):
-            self.boom, self.n = boom, 0
+        def __init__(self, boom, hit=True):
+            self.boom, self.hit, self.n, self.flag = boom, hit, 0, []
 
         def _hot_activate_accessibility(self, hwnd):
             self.n += 1
             if self.boom:
                 raise RuntimeError("扫描炸了")
-            return True
+            return self.hit
+
+        def _set_screen_reader_flag(self, on):
+            self.flag.append(bool(on))
 
     s = Stub(boom=True)
     check("_hot_activate_accessibility 抛异常时 _wake_accessibility 返回 False",
@@ -677,6 +760,188 @@ def t_gate() -> None:
     check("两个窗口都试过（异常被逐个吞掉）", s.n == 2, "%d 次" % s.n)
     s2 = Stub(boom=False)
     check("正常路径仍然返回 True", WeChatUIA._wake_accessibility(s2) is True)
+    s3 = Stub(boom=False, hit=True)
+    check("字节那条路走通了就不动系统读屏标志",
+          WeChatUIA._wake_accessibility(s3) is True and s3.flag == [], str(s3.flag))
+    s4 = Stub(boom=False, hit=False)
+    check("走不通才退回设标志（给扫不出 byte 的版本留后路）",
+          WeChatUIA._wake_accessibility(s4) is False and s4.flag == [True],
+          str(s4.flag))
+
+    print("[gate] 搬进 accessibility 之后，pid/模块这两条路还得走得通")
+    # 这条是补的：_pid_from_hwnd 要看 win32 探测位决定走哪条路，代码搬家时
+    # 把 _HAS_WIN32 落在了 uia_driver，现场只是一个被上层 try/except 吞掉的
+    # NameError，表现为「扫到微信窗口但定位不到 Weixin.dll」——离线全绿照样漏。
+    class W32:
+        @staticmethod
+        def GetWindowThreadProcessId(h):
+            return (0, 4321)
+
+    o_proc, o_flag = acc.win32process, acc._HAS_WIN32
+    try:
+        acc.win32process, acc._HAS_WIN32 = W32, True
+        check("有 pywin32 时 _pid_from_hwnd 走 win32process 拿 pid",
+              acc.AccessibilityGate._pid_from_hwnd(9) == 4321,
+              str(acc.AccessibilityGate._pid_from_hwnd(9)))
+        acc.win32process = None
+        check("win32process 调用失败时退回 None（不往外抛）",
+              acc.AccessibilityGate._pid_from_hwnd(9) is None)
+        hwnd = (ctypes.windll.user32.GetShellWindow()
+                or ctypes.windll.user32.GetDesktopWindow())
+        acc._HAS_WIN32 = False
+        via_ctypes = acc.AccessibilityGate._pid_from_hwnd(hwnd)
+        acc._HAS_WIN32, acc.win32process = True, o_proc
+        via_pywin32 = acc.AccessibilityGate._pid_from_hwnd(hwnd)
+        if o_proc is None or not hwnd:
+            print("  · 跳过两条路交叉比对：%s（pid 记未测）"
+                  % ("本机没装 pywin32" if o_proc is None else "当前会话没有桌面窗口"))
+        else:
+            check("没有 pywin32 时 ctypes 分支也给出 pid，且和 pywin32 一致",
+                  bool(via_ctypes) and via_ctypes == via_pywin32,
+                  "hwnd=%s ctypes=%s pywin32=%s" % (hwnd, via_ctypes, via_pywin32))
+    finally:
+        acc.win32process, acc._HAS_WIN32 = o_proc, o_flag
+    print("[gate] 读屏标志：值必须放在 pvParam，常量必须是 0x1046/0x1047")
+    # 真机量出来的两个坑：常量写成了 0x0046/0x0047（那是键盘首选项），而且值塞在
+    # 第二个参数——Windows 直接返回 FALSE + err=87，标志一动没动，还被 except 吞掉。
+    calls, state = [], {"sr": 0}
+
+    def fake_spi(action, ui_param, pv, flags):
+        calls.append((action, ui_param, pv, flags))
+        if action == acc.SPI_GETSCREENREADER:
+            ctypes.cast(pv, ctypes.POINTER(ctypes.c_int))[0] = state["sr"]
+            return 1
+        if action != acc.SPI_SETSCREENREADER or ui_param != 0:
+            return 0                      # 摆错参数：Windows 就是这么拒的
+        state["sr"] = int(getattr(pv, "value", pv) or 0)
+        return 1
+
+    check("SPI 常量指向「屏幕阅读器」而不是键盘首选项",
+          (acc.SPI_GETSCREENREADER, acc.SPI_SETSCREENREADER) == (0x1046, 0x1047),
+          hex(acc.SPI_GETSCREENREADER))
+    check("_spi_screen_reader(True) 真的把标志开上了（按读回判）",
+          acc._spi_screen_reader(True, spi=fake_spi) is True and state["sr"] == 1)
+    set_call = [c for c in calls if c[0] == acc.SPI_SETSCREENREADER][-1]
+    check("值的实参摆在第三位、uiParam 留 0（回摆成 (SET,1,0) 这条就红）",
+          set_call[1] == 0 and set_call[2].value == 1, str(set_call[:3]))
+    o_spi = acc._spi_screen_reader
+    try:
+        acc._spi_screen_reader = lambda enable=None, spi=None: False
+        check("标志没开上时 _set_screen_reader_flag 如实返回 False（不静默）",
+              acc.AccessibilityGate._set_screen_reader_flag(True) is False)
+    finally:
+        acc._spi_screen_reader = o_spi
+
+    src = io.open(os.path.join(ROOT, "wechatauto", "accessibility.py"),
+                  encoding="utf-8").read()
+    body = "\n".join(l for l in src.splitlines()
+                     if not l.strip().startswith(("#", '"', "'")))
+
+    def _refs(text: str):
+        """代码里的 `WeChatUIA.xxx`（按 AST 判，注释和文档字符串不算）。"""
+        return [n.lineno for n in ast.walk(ast.parse(text))
+                if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                and n.value.id == "WeChatUIA"]
+
+    check("残留引用判据本身有效：植入一条就能抓到",
+          _refs("def f():\n    return WeChatUIA._pid_from_hwnd(1)\n") == [2],
+          str(_refs("def f():\n    return WeChatUIA._pid_from_hwnd(1)\n")))
+    check("accessibility.py 里没有残留 WeChatUIA 代码级引用（只许在注释里）",
+          not _refs(src), "行 %s" % _refs(src))
+    check("accessibility.py 自带 win32 探测位（不靠 uia_driver 的）",
+          "_HAS_WIN32" in body and "win32process" in body)
+
+    def _dangling(src: str):
+        """模块里「拿来当属性访问、却从没定义/导入」的名字。
+
+        搬文件最容易落下的就是这类：别名没跟着走，NameError 又被上层
+        ``except Exception`` 吞掉，现场只剩一句「控件树拿不到」。
+        """
+        import builtins
+        tree = ast.parse(src)
+        defined = set(dir(builtins)) | {"__file__", "__name__", "__doc__"}
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.Import, ast.ImportFrom)):
+                for a in n.names:
+                    defined.add((a.asname or a.name).split('.')[0])
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(n.name)
+            elif isinstance(n, ast.arg):
+                defined.add(n.arg)
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                defined.add(n.id)
+            elif isinstance(n, ast.ExceptHandler) and n.name:
+                defined.add(n.name)
+            elif isinstance(n, (ast.Global, ast.Nonlocal)):
+                defined.update(n.names)
+        out = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name):
+                if n.value.id not in defined:
+                    out.add(n.value.id)
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                if n.id not in defined:
+                    out.add(n.id)
+        return sorted(out)
+
+    check("悬空别名判据本身有效：植入一个没导入的名字就能抓到",
+          _dangling("def f():\n    return ghost.x\n") == ["ghost"])
+    check("悬空别名判据也认得裸引用（_HAS_WIN32 那类）",
+          _dangling("def f():\n    return _NO_SUCH_FLAG and x.y\n") != [])
+    for _f in ("accessibility", "uia_driver", "labels", "forward", "wx", "cli"):
+        _src = io.open(os.path.join(ROOT, "wechatauto", _f + ".py"),
+                       encoding="utf-8").read()
+        check("%s.py 里没有用了却没导入的名字" % _f, not _dangling(_src),
+              str(_dangling(_src)))
+    check("_mmui_present 真的走 uiautomation 查树（不是恒 False 的空壳校验）",
+          "import uiautomation as auto" in
+          io.open(os.path.join(ROOT, "wechatauto", "accessibility.py"),
+                  encoding="utf-8").read())
+
+    # 独立脚本 tools/wake_uia.py 是 gate 的第二份实现：它必须真的独立，也必须
+    # 跟库认同同一个字节，否则「拷出去就能用」这句话会悄悄过期。
+    tools_dir = os.path.join(ROOT, "tools")
+    sys.path.insert(0, tools_dir)
+    try:
+        import wake_uia
+    finally:
+        sys.path.remove(tools_dir)
+    solo_imports = set()
+    for n in ast.walk(ast.parse(io.open(os.path.join(tools_dir, "wake_uia.py"),
+                                        encoding="utf-8").read())):
+        if isinstance(n, ast.Import):
+            solo_imports.update(a.name.split('.')[0] for a in n.names)
+        elif isinstance(n, ast.ImportFrom) and n.module:
+            solo_imports.add(n.module.split('.')[0])
+    check("wake_uia.py 独立成篇：不 import wechatauto",
+          "wechatauto" not in solo_imports, str(sorted(solo_imports)))
+    check("wake_uia.py 与库认同同一个 gate（版本表 + 字节码特征 + core 串）",
+          (wake_uia.QACCESSIBLE_ACTIVE_RVA_BY_VERSION ==
+           acc.QACCESSIBLE_ACTIVE_RVA_BY_VERSION
+           and wake_uia.QACCESSIBLE_GATE_PATTERN.pattern ==
+           acc.QACCESSIBLE_GATE_PATTERN.pattern
+           and wake_uia.QACCESSIBLE_CORE_STRING == acc.QACCESSIBLE_CORE_STRING))
+    _d = build(4096, 7)
+    plant_rex(_d, 100, TGT_HI)
+    plant_plain(_d, 250, TGT_HI)
+    _d = bytes(_d)
+    _s = secs(len(_d))
+    check("两边 RIP 相对引用扫描结果一致（脚本那份没走偏）",
+          sorted(wake_uia.rip_xrefs(_d, _s, TGT_HI)) ==
+          sorted(WeChatUIA._rip_xrefs_to_rva(_d, _s, TGT_HI)),
+          "%d 个 xref" % len(wake_uia.rip_xrefs(_d, _s, TGT_HI)))
+    kernel32 = os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
+                            "System32", "kernel32.dll")
+    try:
+        with open(kernel32, "rb") as f:
+            real_pe = f.read()[:64 * 1024]      # 段表就在头部，不需要整份
+    except OSError:
+        real_pe = b""
+    check("两边 PE 段表解析一致（拿 kernel32.dll 对拍）",
+          bool(real_pe) and wake_uia.pe_sections(real_pe) ==
+          WeChatUIA._pe_sections(real_pe) and
+          len(wake_uia.pe_sections(real_pe)) > 0,
+          "%d 个段" % len(wake_uia.pe_sections(real_pe)))
 
 
 # ----------------------------------------------------------------------
@@ -1364,6 +1629,7 @@ def t_tree() -> None:
     import types
 
     import wechatauto.uia_driver as ud
+    import wechatauto.accessibility as acc      # gate 本体在这里，桩要打对模块
     from wechatauto.uia_driver import WeChatUIA
 
     u = WeChatUIA.__new__(WeChatUIA)
@@ -1433,8 +1699,12 @@ def t_tree() -> None:
             pass
 
     c = Counter()
-    o_log, o_set = ud.wxlog, set(ud._GATE_BLOCK_WARNED)
-    ud.wxlog, ud._GATE_BLOCK_WARNED = c, set()
+    # gate 本体挪到了 wechatauto.accessibility：日志器和「每种原因只说一次」的
+    # 去重集合都在那边，要打的桩得打在那边，否则这条判据就成了空转。
+    o_log, o_acc_log = ud.wxlog, acc.wxlog
+    o_acc_set = set(acc._GATE_BLOCK_WARNED)
+    ud.wxlog, acc.wxlog = c, c
+    acc._GATE_BLOCK_WARNED = set()
     try:
         bad = {'win32': True, 'matched': 2, 'kept': 0}
         u._warn_gate_blocked(bad)
@@ -1469,8 +1739,11 @@ def t_tree() -> None:
             WeChatUIA._warn_gate_blocked = o_warn
             ud.win32gui, ud._HAS_WIN32 = o_gui2, o_has2
     finally:
-        ud.wxlog, ud._GATE_BLOCK_WARNED = o_log, o_set
-    check("wxlog 与去重集合已还原", ud.wxlog is not c and isinstance(ud._GATE_BLOCK_WARNED, set))
+        ud.wxlog, acc.wxlog = o_log, o_acc_log
+        acc._GATE_BLOCK_WARNED = o_acc_set
+    check("wxlog 与去重集合已还原（gate 那边也得还原，不然污染下一个用例）",
+          ud.wxlog is not c and acc.wxlog is not c
+          and isinstance(acc._GATE_BLOCK_WARNED, set))
 
     print("[tree] ensure_window 的兜底分支也不再静默")
     import os
@@ -1565,6 +1838,24 @@ def t_tree() -> None:
         ud.rhythm, ud.wxlog = o_rhythm, o_log
     check("rhythm 与 wxlog 已还原",
           ud.rhythm is o_rhythm and ud.wxlog is o_log)
+
+    # 输入框 Name 的「会话名 + 占位符尾巴」：微信 4.1.15.53 把文案从
+    # 「按住鼠标 语音输入文字」换成「长按鼠标 语音输入」。以前那版是逐字抄文案的
+    # 字面表，文案一改就整表失配，current_chat() 带回占位符 → 全库 == who 判定失效。
+    print("[tree] 会话名尾巴剥离（跨文案版本）")
+    from wechatauto.uia_driver import _clean_chat_name
+    check("旧文案尾巴（4.1.15.13 实测）剥掉",
+          _clean_chat_name("文件传输助手按住鼠标 语音输入文字") == "文件传输助手")
+    check("新文案尾巴（4.1.15.53 实测）剥掉",
+          _clean_chat_name("某群名长按鼠标 语音输入") == "某群名")
+    check("新文案无空格变体剥掉",
+          _clean_chat_name("某群名长按鼠标语音输入") == "某群名")
+    check("裸尾巴也剥（只剩占位符时原样返回，不吃掉名字）",
+          _clean_chat_name("语音输入文字") == "语音输入文字")
+    check("正常会话名不误伤（带括号/备注也不动）",
+          _clean_chat_name("某群名（置顶）") == "某群名（置顶）")
+    check("剥完就能 == 上（open_chat 末尾那步校验的口径）",
+          _clean_chat_name("文件传输助手长按鼠标 语音输入") == "文件传输助手")
 
 
 # ----------------------------------------------------------------------
@@ -3120,6 +3411,44 @@ def t_cli() -> None:
           cli.resolve_chat(FakeDB(), "26级新生群") == ("26级新生群", "26级新生群"))
     check("空串不炸", cli.resolve_chat(FakeDB(), "") == ("", ""))
 
+    print("[cli] 发完回读数据库的间隔也能从命令行调")
+    from wechatauto.param import WxParam
+    keep = (WxParam.DB_VERIFY_INTERVAL, WxParam.DB_VERIFY_TIMEOUT)
+    ap = cli.build_parser()
+    try:
+        ns = ap.parse_args(["send", "hi", "--verify",
+                           "--verify-interval", "0.3", "--verify-timeout", "2"])
+        cli._apply_verify_interval(ns)
+        check("--verify-interval / --verify-timeout 落到 WxParam",
+              (WxParam.DB_VERIFY_INTERVAL, WxParam.DB_VERIFY_TIMEOUT) == (0.3, 2.0),
+              "%s/%s" % (WxParam.DB_VERIFY_INTERVAL, WxParam.DB_VERIFY_TIMEOUT))
+        WxParam.DB_VERIFY_INTERVAL, WxParam.DB_VERIFY_TIMEOUT = keep
+        cli._apply_verify_interval(ap.parse_args(["send", "hi"]))
+        check("不传这俩开关就一个数都不改（默认仍是 1.0/8.0）",
+              (WxParam.DB_VERIFY_INTERVAL, WxParam.DB_VERIFY_TIMEOUT) == (1.0, 8.0))
+        got = {}
+        for name, argv in (("forward", ["forward", "--to", "A", "--verify-interval", "0.5"]),
+                           ("labels", ["labels", "send", "--label", "x",
+                                       "--verify-timeout", "3"])):
+            a = ap.parse_args(argv)
+            got[name] = (a.verify_interval, a.verify_timeout)
+        check("forward / labels 也认这两个开关（各自解出对应的值）",
+              got == {"forward": (0.5, None), "labels": (None, 3.0)}, str(got))
+
+        r = ap.parse_args(["remark", "小明", "--to", "新备注"])
+        check("备注子命令：--to 走改名，另一个是只读探测",
+              (r.contact, r.to, r.probe, r.clear) == ("小明", "新备注", False, False))
+        r2 = ap.parse_args(["remark", "小明", "--clear"])
+        check("--clear 走清空（allow_empty），不是拿空串去当新备注",
+              r2.clear is True and r2.to is None)
+        r3 = ap.parse_args(["remark", "小明", "--probe"])
+        check("--probe 解出来是探测模式", r3.probe is True)
+        check("中文别名「备注 / 改备注」都指向 remark",
+              cli.ALIASES.get("备注") == "remark" and cli.ALIASES.get("改备注") == "remark",
+              str(cli.ALIASES.get("备注")))
+    finally:
+        WxParam.DB_VERIFY_INTERVAL, WxParam.DB_VERIFY_TIMEOUT = keep
+
     print("[cli] 正文与时间：XML 别满屏标签")
     vid = {"type": "视频", "create_time": 1790000000,
            "content": '<?xml version="1.0"?><msg><videomsg length="4211669" '
@@ -3432,17 +3761,160 @@ def t_cli() -> None:
                                  "from wechatauto import MomentDB")))
 
 
+def t_remark() -> None:
+    """改备注：锚点、落点归属、粘贴回读、清空语义、回读口径。
+
+    这条路的每一步都是真机量出来的（2026-10-16/17，4.1.15.13），所以离线这边钉的是
+    「别再退回那些踩过的坑」：拿主窗句柄点浮层里的搜索结果会被落点校验拒、粘贴落空
+    不能当成功、清空后备注变空串（不能拿新值当搜索键去查）、空备注必须显式要求。
+    """
+    import io
+
+    import wechatauto.remark as R
+
+    print("[remark] 锚点（真机实测的那几个）")
+    check("联系人行 / 资料页 / 入口按钮的类名对得上",
+          (R.CONTACT_ITEM_CLS, R.PROFILE_CLS, R.MORE_BTN_NAME) ==
+          ("mmui::ContactsCellItemView", "mmui::ProfileView", "更多"))
+    check("菜单项与编辑窗的锚点对得上",
+          (R.MENU_ITEM_CLS, R.MENU_SET_REMARK, R.EDIT_TITLE) ==
+          ("mmui::XMenuView", "设置备注和标签", "设置备注和标签"))
+    check("编辑框 / 完成 / 取消 的锚点对得上",
+          (R.REMARK_EDIT_CLS, R.REMARK_EDIT_NAME, R.BTN_DONE, R.BTN_CANCEL) ==
+          ("mmui::XLineEdit", "修改备注名", "完成", "取消"))
+
+    print("[remark] 落点归属：浮层里的控件要用归属窗口去点")
+
+    class FakeCtrl:
+        def __init__(self, box):
+            self._box = box
+            self.Name = "x"
+            self.AutomationId = ""
+
+        @property
+        def BoundingRectangle(self):
+            return self._box
+
+    class Box:
+        def __init__(self, l, t, r, b):
+            self.left, self.top, self.right, self.bottom = l, t, r, b
+
+        def width(self):
+            return self.right - self.left
+
+        def height(self):
+            return self.bottom - self.top
+
+    ops = R.RemarkOps.__new__(R.RemarkOps)      # 不跑 __init__（不碰真微信）
+    seen = []
+    ops._click = lambda hwnd, ctrl, right=False, at=None, raise_it=True: (
+        seen.append(hwnd) or {"ok": True, "reason": "ok"})
+    ops._owner_at = lambda x, y: 424242        # 假装归属是浮层
+    ops._click_owned(FakeCtrl(Box(100, 200, 300, 260)), hwnd=111)
+    check("按落点归属的窗口点（不是主窗）", seen == [424242], str(seen))
+    ops._owner_at = lambda x, y: 0
+    seen.clear()
+    ops._click_owned(FakeCtrl(Box(100, 200, 300, 260)), hwnd=111)
+    check("算不出归属时退回调用方给的窗口", seen == [111], str(seen))
+
+    print("[remark] 粘贴要回读；空备注要显式要")
+    ops2 = R.RemarkOps.__new__(R.RemarkOps)
+    ops2._current_remark = lambda w: ""
+    checks = []
+
+    class EditWin:
+        pass
+
+    def _fake_find(root, names, cls=None, contains=True, exact_first=True):
+        return object() if cls == R.REMARK_EDIT_CLS else None
+
+    ops2._find = _fake_find
+    calls = {'typed': None}
+
+    class FakeUIA:
+        @staticmethod
+        def _clip_set(t):
+            calls['typed'] = t
+
+        @staticmethod
+        def _read_edit_value(ctrl):
+            return "贴错了"
+
+    import wechatauto.uia_driver as ud_mod
+    old_uia, old_press = ud_mod.WeChatUIA, R._press
+    try:
+        ud_mod.WeChatUIA = FakeUIA
+        R._press = lambda *a: None
+        r = ops2._type_remark(EditWin(), "想要的")
+        checks.append(("贴进去的和要的不一样 → 报错", not r["ok"] and
+                       "paste-mismatch" in r["reason"]))
+        FakeUIA._read_edit_value = staticmethod(lambda c: "想要的")
+        r2 = ops2._type_remark(EditWin(), "想要的")
+        checks.append(("贴对了就通过", r2["ok"]))
+    finally:
+        ud_mod.WeChatUIA, R._press = old_uia, old_press
+    for name, ok in checks:
+        check(name, ok)
+
+    class Ops3(R.RemarkOps):
+        def __init__(self):
+            pass
+
+    o3 = Ops3()
+    r = o3.set_remark("某人", "")
+    check("空备注不显式允许就被拒（别悄悄抹掉人家的备注）",
+          not r["ok"] and "bad-args" in r["reason"], r["reason"])
+
+    print("[remark] 回读按 username 查（清空那次的空串搜不到人）")
+
+    class Ops4(Ops3):
+        def __init__(self):
+            self._hits = {"wxid_a": [{"username": "wxid_a", "nick_name": "某人",
+                                      "remark": "旧备注"}]}
+
+        class _DB:
+            def __init__(self, outer):
+                self.o = outer
+
+            def search_contact(self, kw):
+                if kw == "wxid_a":
+                    return self.o._hits["wxid_a"]
+                return []           # 拿空串去搜谁都搜不到（真机就是这么回事）
+
+        @property
+        def db(self):
+            return Ops4._DB(self)
+
+    o4 = Ops4()
+    check("按 username 查得动（改成功）",
+          o4._remark_landed("wxid_a", "旧备注") is True)
+    check("清空后按 username 查得动（空串 = 已清空）",
+          o4._remark_landed("wxid_a", "") is False)   # 库里还是旧值 → 还没落库
+    o4._hits["wxid_a"][0]["remark"] = ""
+    check("库里真清空了就认", o4._remark_landed("wxid_a", "") is True)
+    check("username 为空时直接判否，不去瞎猜",
+          o4._remark_landed("", "") is False)
+
+    print("[remark] 模块边界：与标签同族，不自己重造脚手架")
+    src = io.open(os.path.join(ROOT, "wechatauto", "remark.py"),
+                  encoding="utf-8").read()
+    check("RemarkOps 继承 LabelOps（复用抬窗/落点校验/小窗枚举）",
+          "class RemarkOps(LabelOps)" in src)
+    check("没有自己 import uiautomation / ctypes 去另起一套点击",
+          "import uiautomation" not in src)
+
+
 TESTS = {"layout": t_layout, "verify": t_verify, "rhythm": t_rhythm,
          "gate": t_gate, "click": t_click, "listen": t_listen, "moment": t_moment,
          "sender": t_sender, "voice": t_voice, "tree": t_tree, "image": t_image,
          "keys": t_keys, "sessions": t_sessions, "messages": t_messages,
-         "cli": t_cli}
+         "cli": t_cli, "remark": t_remark}
 
 
 def main() -> int:
     want = sys.argv[1:] or ["layout", "verify", "rhythm", "gate", "click", "listen",
                             "moment", "sender", "voice", "tree", "image",
-                            "keys", "sessions", "messages", "cli"]
+                            "keys", "sessions", "messages", "cli", "remark"]
     for name in want:
         fn = TESTS.get(name)
         if not fn:

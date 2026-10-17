@@ -54,6 +54,24 @@ def _die(msg, code=1):
     return code
 
 
+def _verify_opts(p):
+    """发完回读数据库那条路的两个可调项（不传就用 WxParam 的默认值）。"""
+    p.add_argument("--verify-interval", type=float,
+                   help="回读轮询间隔秒，默认 1.0")
+    p.add_argument("--verify-timeout", type=float,
+                   help="回读等待上限秒，默认 8.0（设 0 = 只读一次）")
+    return p
+
+
+def _apply_verify_interval(args):
+    from wechatauto.param import WxParam
+    if getattr(args, "verify_interval", None) is not None:
+        WxParam.DB_VERIFY_INTERVAL = args.verify_interval
+    if getattr(args, "verify_timeout", None) is not None:
+        WxParam.DB_VERIFY_TIMEOUT = args.verify_timeout
+    return WxParam
+
+
 def _db():
     from wechatauto import WeChatDB
     try:
@@ -225,6 +243,7 @@ def cmd_export(args):
 def cmd_send(args):
     if not (args.text or args.file or args.image):
         return _die("要发东西：`send 你好 --to 文件传输助手`，或 --file / --image")
+    _apply_verify_interval(args)
     from wechatauto.guia import quick_send, quick_send_file, quick_send_image
     db = _db()
     _user, display = resolve_chat(db, args.to or "filehelper")
@@ -333,6 +352,7 @@ def cmd_moments(args):
 def cmd_forward(args):
     """右键「转发」一条消息，分别发给指定人或整个标签（默认只预演）。"""
     from wechatauto.wx import WeChat
+    _apply_verify_interval(args)
     wx = WeChat()
     dry = not args.go
     if args.label:
@@ -371,9 +391,49 @@ def cmd_forward(args):
     return 0 if r["status"] == "成功" else 1
 
 
+def cmd_remark(args):
+    """改联系人备注：通讯录 → 点开联系人 → 资料页「更多」→「设置备注和标签」。
+
+    界面路径与「标签」同族（共用 LabelOps 的脚手架），实现在 wechatauto.remark。
+    """
+    from wechatauto.wx import WeChat
+    if not (args.contact or "").strip():
+        print("要改谁？`备注 小明 --to 新备注`；只想看路径通不通：`备注 小明 --probe`")
+        return 2
+    wx = WeChat()
+    if getattr(args, "probe", False):
+        r = wx.ProbeRemark(args.contact.strip())
+    elif getattr(args, "clear", False):
+        r = wx.RenameMember(args.contact.strip(), "", allow_empty=True,
+                            verify=not getattr(args, "no_verify", False))
+    else:
+        new = (args.to or "").strip()
+        if not new:
+            print("要改成什么？--to \"新备注\"（清空备注用 --clear）")
+            return 2
+        r = wx.RenameMember(args.contact.strip(), new,
+                            verify=not getattr(args, "no_verify", False))
+    print("[%s] %s" % (r["status"], r.get("message")))
+    data = r.get("data") or {}
+    if data.get("who"):
+        print("  联系人：%s" % data["who"])
+    if data.get("before") not in (None, ""):
+        print("  原备注：%s" % data["before"])
+    if data.get("fields"):
+        f = data["fields"] or {}
+        print("  编辑窗：输入框=%s 当前备注=%r 按钮=%s"
+              % (f.get("remark_edit"), f.get("current"), f.get("buttons")))
+    for step, res in (data.get("steps") or []):
+        print("  %-18s %s" % (step, res.get("reason") if isinstance(res, dict) else res))
+    if data.get("reason"):
+        print("  细节：%s" % data["reason"])
+    return 0 if r["status"] == "成功" else 1
+
+
 def cmd_labels(args):
     """通讯录标签：列表走库（不碰窗口），建/加/移走界面。"""
     action = args.action
+    _apply_verify_interval(args)
     if action == "list":
         if getattr(args, "ui", False):
             from wechatauto.wx import WeChat      # 只有真要驱动界面时才 import
@@ -421,9 +481,13 @@ def cmd_labels(args):
     elif action == "rename":
         new = (args.to or "").strip()
         if not new:
-            print("改名要给新名字：--label 老名 --to 新名")
+            print("改名要给新名字：--label 老名 --to 新名（标签）或 --contact + --to（备注）")
             return 2
-        r = wx.RenameLabel(args.label, new)
+        # 有 contact 参数时是改备注，没给就是重命名标签
+        if getattr(args, "contact", None):
+            r = wx.RenameMember(args.contact, new)
+        else:
+            r = wx.RenameLabel(args.label, new)
     else:
         members = [m for m in (args.members or "").replace("，", ",").split(",")
                    if m.strip()]
@@ -517,6 +581,7 @@ def build_parser():
     s.add_argument("--file")
     s.add_argument("--image")
     s.add_argument("--verify", action="store_true", help="发完回读数据库确认")
+    _verify_opts(s)
 
     s = add("images", cmd_images, "下载某个会话的图片")
     s.add_argument("chat")
@@ -538,15 +603,17 @@ def build_parser():
     s.add_argument("--json", action="store_true")
 
     s = add("labels", cmd_labels,
-            "通讯录标签：list/members 读，create/add/remove/delete 改，send 批量发")
+            "通讯录标签：list/members 读，create/add/remove/delete/rename 改，send 批量发")
     s.add_argument("action",
                    choices=["list", "create", "add", "remove", "delete", "rename",
                             "members", "send", "probe"],
                    nargs="?", default="list",
                    help="list=只看有哪些标签（不动窗口）；members=列某标签的全部成员；"
-                        "send=按标签群发；probe=走一遍路径报哪步断")
+                        "send=按标签群发；probe=走一遍路径报哪步断；"
+                        "rename=重命名标签 / 备注=改联系人昵称（见下）")
     s.add_argument("--label", help="标签名（除 list 外都要给）")
-    s.add_argument("--to", help="rename 的新名字")
+    s.add_argument("--to", help="rename 的新名字（或备注的 --contact + --to）")
+    s.add_argument("--contact", help="改备注时指定联系人（与 --to 配合使用）")
     s.add_argument("--ui", action="store_true",
                    help="list 时读管理窗左栏（是准数，还带人数，但会动窗口）；"
                         "不给就只读库")
@@ -557,6 +624,7 @@ def build_parser():
     s.add_argument("--go", action="store_true", help="send 时真的发出去")
     s.add_argument("--limit", type=int, help="members/send 最多几个人")
     s.add_argument("--dump", help="probe 时把每步可见的控件名写到这个目录")
+    _verify_opts(s)
 
     s = add("forward", cmd_forward,
             "右键「转发」一条消息：分别发给指定人或整个标签（默认只预演）")
@@ -572,6 +640,15 @@ def build_parser():
     s.add_argument("--go", action="store_true", help="真的发出去")
     s.add_argument("--no-verify", action="store_true",
                    help="发完不回读每个人的会话确认（默认回读）")
+    _verify_opts(s)
+
+    s = add("remark", cmd_remark, "改联系人备注（会驱动微信窗口）")
+    s.add_argument("contact", nargs="?", help="联系人显示名（通讯录左栏里的名字）")
+    s.add_argument("--to", help="新备注")
+    s.add_argument("--probe", action="store_true",
+                   help="只走一遍路径并打开编辑窗，随即关掉（不写任何东西）")
+    s.add_argument("--clear", action="store_true", help="清空这个联系人的备注")
+    s.add_argument("--no-verify", action="store_true", help="改完不回读数据库确认")
     return p
 
 
@@ -590,6 +667,7 @@ ALIASES = {
     "朋友圈": "moments",
     "标签": "labels", "打标签": "labels", "设标签": "labels",
     "转发": "forward", "转给": "forward",
+    "备注": "remark", "改备注": "remark", "设置备注和标签": "remark",
 }
 
 _MENU = (
@@ -603,6 +681,7 @@ _MENU = (
     ("8", "体检：账号 / 密钥 / 控件树", "doctor"),
     ("9", "通讯录标签：看/建标签、给标签批量加移成员（会驱动微信窗口）", "labels"),
     ("10", "右键转发一条消息：发给指定人或整个标签（先预演）", "forward"),
+    ("11", "改联系人备注（通讯录 → 资料页 → 设置备注和标签）", "remark"),
     ("0", "退出", None),
 )
 

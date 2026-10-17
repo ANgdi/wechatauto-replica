@@ -823,6 +823,72 @@ class WeChat(Chat, Listener):
         return WxResponse.success(f"标签「{name}」已删除", _plain_result(r))
 
     @uilock
+    def RenameMember(self, who: str, new_remark: str, verify: bool = True,
+                     allow_empty: bool = False) -> WxResponse:
+        """改联系人备注（通讯录 → 点开联系人 → 资料页「更多」→「设置备注和标签」）。
+
+        界面路径与「标签」同族：共用 :class:`wechatauto.labels.LabelOps` 那套脚手架
+        （抬窗、落点归属校验、独立小窗枚举），实现在 :mod:`wechatauto.remark`。
+        锚点（4.1.15.13 真机实测）：
+
+        * 联系人行 ``mmui::ContactsCellItemView``，Name 就是显示名（备注优先）；
+        * 入口是资料页 ``mmui::ProfileView`` 里昵称右边那颗 ``mmui::XButton``（'更多'）
+          ——主窗导航栏底部也有一颗「更多」，所以必须限定在资料页子树里找；
+        * 菜单项 ``mmui::XMenuView``（'设置备注和标签'）：菜单挂在主窗树里，屏幕
+          归属却是另一颗顶层小窗，必须用那颗小窗的句柄点，否则落点校验会拒；
+        * 编辑窗标题就是「设置备注和标签」，输入框 ``mmui::XLineEdit``，
+          底部 ``mmui::XOutlineButton``：完成 / 取消。
+
+        Args:
+            who: 联系人显示名（通讯录左栏里的那个名字）
+            new_remark: 新备注
+            verify: 改完回读 contact.db 的 remark 字段确认
+        """
+        ops = self._remarks()
+        if ops is None:
+            return WxResponse.failure('UIA 驱动不可用，无法改备注')
+        r = ops.set_remark(who, new_remark, verify=verify, allow_empty=allow_empty)
+        if not r.get('ok'):
+            return WxResponse.failure(f"改备注失败：{r.get('reason')}",
+                                      _plain_result(r))
+        before = r.get("before") or ""
+        if not new_remark:
+            return WxResponse.success("备注已清空", _plain_result(r))
+        return WxResponse.success(
+            f"备注已改为「{new_remark}」"
+            + (f"（原备注「{before}」）" if before and before != new_remark else ""),
+            _plain_result(r))
+
+    @uilock
+    def ProbeRemark(self, who: str = None) -> WxResponse:
+        """只走一遍「资料页 → 更多 → 设置备注和标签」，打开编辑窗后立刻关掉。"""
+        ops = self._remarks()
+        if ops is None:
+            return WxResponse.failure('UIA 驱动不可用，无法探测')
+        r = ops.probe(who)
+        if not r.get('ok'):
+            steps = r.get("steps") or []
+            tail = "；".join(
+                "%s=%s" % (k, (v.get("reason") if isinstance(v, dict) else v))
+                for k, v in steps[-3:])
+            return WxResponse.failure(f"探测失败：{r.get('reason')}"
+                                      + (f"（走到：{tail}）" if tail else ""),
+                                      _plain_result(r))
+        return WxResponse.success(
+            f"探测通过：备注入口可用（联系人「{r.get('who')}」，当前备注"
+            f"「{(r.get('fields') or {}).get('current')}」）", _plain_result(r))
+
+    def _remarks(self, uia=None):
+        """构造 :class:`RemarkOps`（与标签共用脚手架）；UIA 树不可用时返回 None。"""
+        from wechatauto.remark import RemarkOps
+        eng = uia if uia is not None else self._gui._get_uia()
+        if eng is None:
+            eng = self._gui._get_uia(refresh=True)
+        if eng is None:
+            return None
+        return RemarkOps(uia=eng, db=self._db)
+
+    @uilock
     def LabelMembers(self, label: str, limit: int = None) -> WxResponse:
         """列出一个标签里的**全部**成员（右侧列表是虚拟化的，靠滚动取全量）。
 

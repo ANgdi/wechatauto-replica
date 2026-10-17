@@ -50,6 +50,7 @@ except Exception:                                   # pragma: no cover
     _HAS_WIN32 = False
 
 from wechatauto import rhythm
+from wechatauto import accessibility as _acc
 from wechatauto.logger import wxlog
 from wechatauto.param import WxParam
 
@@ -72,19 +73,20 @@ CHAT_INPUT_AID = "chat_input_field"                # 输入框；其 .Name == �
 # （文件传输助手 → Name = "文件传输助手按住鼠标 语音输入文字"）。不剥掉的话
 # 全库那些 ``current_chat() == who`` 比较统统失效：会话明明已经打开，open_chat
 # 照样返回 False，发送被推去走 OCR/坐标路径（慢且更易错）。
+# 2026-10-13 升到 4.1.15.53，同一颗键的文案换成「长按鼠标 语音输入」，逐字抄文案的
+# 字面表整表失配、症状原样复发——所以按形状匹配这一族（(长按|按住)鼠标 + 语音输入 +
+# 可选「文字」，裸的「语音输入文字」也在同一个模式里），不再记平台文案。
 # 未命中任何尾巴就原样返回，行为与剥之前的版本一致。
-CHAT_NAME_SUFFIXES = ("按住鼠标 语音输入文字", "按住鼠标语音输入文字", "语音输入文字")
+CHAT_NAME_TAIL = re.compile(r"(?:(?:长按|按住)鼠标\s*)?语音输入(?:文字)?$")
 
 
 def _clean_chat_name(name: Optional[str]) -> Optional[str]:
     if not name:
         return None
     stripped = name.strip()
-    for suffix in CHAT_NAME_SUFFIXES:
-        if stripped.endswith(suffix):
-            head = stripped[:-len(suffix)].strip()
-            if head:
-                return head
+    head = CHAT_NAME_TAIL.sub("", stripped).strip()
+    if head:
+        return head
     return stripped or None
 # 行内表情码：微信输入框把 [微笑] 这类代码渲染成 1 个 U+FFFC 对象占位符
 # （2026-10-04 实测 4.1.15.13），发送前回读比对时要按这个折算。
@@ -106,9 +108,6 @@ SEARCH_LIST_AIDS = ("search_list",)
 CHAT_INPUT_AIDS = ("chat_input_field",)
 SNS_LIST_CLASSES = ("mmui::TimeLineListView",)
 SNS_LIST_AIDS = ("sns_list",)
-
-# 「扫不到可用窗口」这类失败每种原因一个进程只警告一次（长驻进程每轮都扫）
-_GATE_BLOCK_WARNED = set()
 
 # 左侧导航栏（4.1.13 实测）：MainTabBar 下四个 XTabBarItem，顺序固定
 # 微信/通讯录/收藏/发现。tab 自己读不到选中态（ButtonControl，既不支持
@@ -175,111 +174,6 @@ SECTION_HEADERS = {
     "聊天记录", "收藏", "功能", "小程序", "最近使用过的小程序", "视频号",
     "企业微信联系人", "朋友圈", "搜索网络结果", "企业微信",
 }
-
-# ---------------------------------------------------------------------------
-# 无障碍“屏幕阅读器”系统标志 / Qt accessibility gate
-# ---------------------------------------------------------------------------
-SPI_GETSCREENREADER = 0x0046
-SPI_SETSCREENREADER = 0x0047
-SPIF_SENDCHANGE = 0x02
-
-# 微信内置 Qt accessibility gate：QAccessible 查询前会检查一个运行时 active
-# byte。冷启动未启用读屏时该 byte 为 0，WM_GETOBJECT 只能拿到 Qt 外壳；
-# 热写为 1 后当前进程立即返回 mmui provider，无需重启微信。优先从 Weixin.dll
-# 自动扫描该 byte 的 RVA，下面的版本表仅作扫描失败时的兜底。
-QACCESSIBLE_ACTIVE_RVA_BY_VERSION = {
-    "4.1.11.22": 0x0A1E7DB8,
-    "4.1.13.65": 0x0AE2B0C8,   # 2026-09-12 实测：热写后 mmui 树立即物化
-    "4.1.15.13": 0x0B135C38,   # 2026-09-23 实测：扫描得出，热写后校验通过
-}
-QACCESSIBLE_CORE_STRING = b"qt.accessibility.core"
-QACCESSIBLE_GATE_PATTERN = re.compile(
-    rb"\x48\x85\xc9\x0f\x84....\x80\x3d(?P<disp>.{4})"
-    rb"\x00\x0f\x84",
-    re.DOTALL,
-)
-
-# 已验证的 gate RVA：按 Weixin.dll 身份（版本目录+大小+mtime）缓存。
-# 好处：换版本后优先使用上次真正生效过的地址；命中时无需重扫 198MB DLL。
-# 这份表同时落盘（见下），否则每个新进程都要重付扫描成本。
-_VERIFIED_GATE_RVA: Dict[str, int] = {}
-
-
-def _dll_identity(dll_path: str) -> str:
-    """Weixin.dll 身份串：版本目录 + 文件大小 + mtime（升级/热更新可区分）。"""
-    try:
-        st = os.stat(dll_path)
-        ver = os.path.basename(os.path.dirname(dll_path))
-        return "%s|%d|%d" % (ver, st.st_size, int(st.st_mtime))
-    except OSError:
-        return dll_path
-
-
-# gate 扫描结果按 DLL 身份落盘。必须落盘而不是只留 lru_cache：本库的典型用法
-# 是一个脚本一个新 Python 进程，进程内缓存在这种用法下等于没有——每次启动都
-# 重扫一遍 198MB 的 Weixin.dll（实测 8 秒，慢机上更像卡死）。
-GATE_CACHE_FILE = os.path.join(os.path.expanduser('~'), '.wechatauto',
-                               'gate_cache.json')
-_GATE_CACHE: Optional[Dict[str, dict]] = None
-
-
-def _gate_cache() -> Dict[str, dict]:
-    """读落盘的 gate 缓存（损坏/不存在都按空表处理，不抛）。"""
-    global _GATE_CACHE
-    if _GATE_CACHE is None:
-        data: Dict[str, dict] = {}
-        try:
-            with open(GATE_CACHE_FILE, encoding='utf-8') as f:
-                raw = json.load(f)
-            if isinstance(raw, dict):
-                data = {k: v for k, v in raw.items() if isinstance(v, dict)}
-        except (OSError, ValueError):
-            pass
-        _GATE_CACHE = data
-    return _GATE_CACHE
-
-
-def _gate_cache_put(identity: str, **fields) -> None:
-    """合并写回一条 gate 缓存。写失败只留 debug：缓存丢了不过是重扫一次。"""
-    entry = _gate_cache().setdefault(identity, {})
-    entry.update(fields)
-    try:
-        os.makedirs(os.path.dirname(GATE_CACHE_FILE), exist_ok=True)
-        tmp = GATE_CACHE_FILE + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(_gate_cache(), f, ensure_ascii=False, sort_keys=True)
-        os.replace(tmp, GATE_CACHE_FILE)
-    except OSError as e:
-        wxlog.debug(f'gate 缓存写盘失败（不影响功能）：{e}')
-
-
-IMAGE_SCN_MEM_EXECUTE = 0x20000000
-IMAGE_SCN_MEM_WRITE = 0x80000000
-PROCESS_VM_OPERATION = 0x0008
-PROCESS_VM_READ = 0x0010
-PROCESS_VM_WRITE = 0x0020
-PROCESS_QUERY_INFORMATION = 0x0400
-TH32CS_SNAPMODULE = 0x00000008
-TH32CS_SNAPMODULE32 = 0x00000010
-INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-MAX_MODULE_NAME32 = 255
-MAX_PATH = 260
-
-
-class MODULEENTRY32W(ctypes.Structure):
-    _fields_ = [
-        ("dwSize", ctypes.c_ulong),
-        ("th32ModuleID", ctypes.c_ulong),
-        ("th32ProcessID", ctypes.c_ulong),
-        ("GlblcntUsage", ctypes.c_ulong),
-        ("ProccntUsage", ctypes.c_ulong),
-        ("modBaseAddr", ctypes.POINTER(ctypes.c_ubyte)),
-        ("modBaseSize", ctypes.c_ulong),
-        ("hModule", ctypes.c_void_p),
-        ("szModule", ctypes.c_wchar * (MAX_MODULE_NAME32 + 1)),
-        ("szExePath", ctypes.c_wchar * MAX_PATH),
-    ]
-
 
 # ---------------------------------------------------------------------------
 # 异常
@@ -396,398 +290,6 @@ class WeChatUIA:
         except Exception:
             wxlog.warning("拉起微信失败")
 
-    # ------------------------------------------------------------------ 热激活
-    @staticmethod
-    def _set_screen_reader_flag(enable: bool) -> None:
-        try:
-            ctypes.windll.user32.SystemParametersInfoW(
-                SPI_SETSCREENREADER, 1 if enable else 0, 0, SPIF_SENDCHANGE)
-        except Exception:
-            pass
-
-    @staticmethod
-    def _pid_from_hwnd(hwnd: int) -> Optional[int]:
-        if _HAS_WIN32:
-            try:
-                return win32process.GetWindowThreadProcessId(hwnd)[1]
-            except Exception:
-                return None
-        pid = wintypes.DWORD()
-        try:
-            ctypes.windll.user32.GetWindowThreadProcessId(
-                wintypes.HWND(hwnd), ctypes.byref(pid))
-            return int(pid.value) or None
-        except Exception:
-            return None
-
-    @staticmethod
-    def _process_modules(pid: int):
-        kernel32 = ctypes.windll.kernel32
-        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-        kernel32.Module32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
-        kernel32.Module32FirstW.restype = wintypes.BOOL
-        kernel32.Module32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
-        kernel32.Module32NextW.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        snapshot = kernel32.CreateToolhelp32Snapshot(
-            TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)
-        if snapshot == INVALID_HANDLE_VALUE:
-            return
-        try:
-            entry = MODULEENTRY32W()
-            entry.dwSize = ctypes.sizeof(entry)
-            if not kernel32.Module32FirstW(snapshot, ctypes.byref(entry)):
-                return
-            while True:
-                base = ctypes.cast(entry.modBaseAddr, ctypes.c_void_p).value or 0
-                yield base, int(entry.modBaseSize), entry.szModule, entry.szExePath
-                if not kernel32.Module32NextW(snapshot, ctypes.byref(entry)):
-                    break
-        finally:
-            kernel32.CloseHandle(snapshot)
-
-    @classmethod
-    def _weixin_dll_module(cls, pid: int):
-        for base, size, name, path in cls._process_modules(pid) or ():
-            if name.lower() == "weixin.dll":
-                return base, size, path
-        return None
-
-    @staticmethod
-    def _pe_sections(data: bytes):
-        try:
-            pe_off = struct.unpack_from("<I", data, 0x3C)[0]
-            if data[pe_off:pe_off + 4] != b"PE\0\0":
-                return []
-            coff = pe_off + 4
-            count = struct.unpack_from("<H", data, coff + 2)[0]
-            opt_size = struct.unpack_from("<H", data, coff + 16)[0]
-            sec_off = coff + 20 + opt_size
-            sections = []
-            for i in range(count):
-                off = sec_off + i * 40
-                name = data[off:off + 8].split(b"\0", 1)[0].decode("ascii", "ignore")
-                virtual_size, virtual_address, raw_size, raw_ptr = struct.unpack_from(
-                    "<IIII", data, off + 8)
-                characteristics = struct.unpack_from("<I", data, off + 36)[0]
-                sections.append({
-                    "name": name,
-                    "rva": virtual_address,
-                    "vsize": virtual_size,
-                    "raw_size": raw_size,
-                    "raw_ptr": raw_ptr,
-                    "chars": characteristics,
-                })
-            return sections
-        except Exception:
-            return []
-
-    @staticmethod
-    def _section_for_rva(sections, rva: int):
-        for sec in sections:
-            size = max(sec["vsize"], sec["raw_size"])
-            if sec["rva"] <= rva < sec["rva"] + size:
-                return sec
-        return None
-
-    @staticmethod
-    def _offset_to_rva(sections, offset: int) -> Optional[int]:
-        for sec in sections:
-            if sec["raw_ptr"] <= offset < sec["raw_ptr"] + sec["raw_size"]:
-                return sec["rva"] + offset - sec["raw_ptr"]
-        return None
-
-    @staticmethod
-    def _rip_xrefs_to_rva(data: bytes, sections, target_rva: int) -> List[int]:
-        """可执行段里以 RIP 相对寻址引用 ``target_rva`` 的 LEA 指令 RVA。
-
-        匹配的是 ``[REX] 8D <modrm>``，modrm 满足 ``(b & 0xC7) == 0x05``
-        （mod=00、r/m=101 → RIP 相对），disp32 紧跟其后。
-
-        用 numpy 向量化而不是逐字节 Python 循环：Weixin.dll 有 198MB，老实现
-        扫一次 8 秒，在用户端看起来就是卡死（真有人在这一步按了停止）。两种
-        形态的判定式化简后是同一个 ``file_off + disp == 常数``，因为带 REX 时
-        指令起点前移一字节、长度却多一字节。
-        """
-        try:
-            import numpy as np
-        except ImportError:
-            # numpy 随 opencv-python 一起来，正常装包不会走到这里；真缺了也
-            # 只是退回慢二十多倍的老实现，不能让 UIA 整条路因此消失。
-            return WeChatUIA._rip_xrefs_to_rva_ref(data, sections, target_rva)
-
-        a = np.frombuffer(data, dtype=np.uint8)
-        n = a.size
-        if n < 16:
-            return []
-        # 全局边界 p8d <= n-7：无 REX 形态最晚只能到 end-8，带 REX 的起点是
-        # p8d-1，最晚到 end-8 时 p8d == end-7；disp32 落在 p8d+2..p8d+5。
-        p8d = np.flatnonzero(a == 0x8D)
-        p8d = p8d[(p8d >= 1) & (p8d <= n - 7)]
-        if p8d.size == 0:
-            return []
-        modrm = np.zeros(256, dtype=bool)
-        modrm[[0x05, 0x0D, 0x15, 0x1D, 0x25, 0x2D, 0x35, 0x3D]] = True
-        p8d = p8d[modrm[a[p8d + 1]]]
-        if p8d.size == 0:
-            return []
-        rex = (a[p8d - 1] >= 0x40) & (a[p8d - 1] <= 0x4F)
-        b = a[p8d[:, None] + np.arange(2, 6)].astype(np.int64)
-        disp = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16) | (b[:, 3] << 24)
-        disp -= (disp >= 0x80000000) << 32          # 无符号 32 位 → 有符号
-        total = p8d + disp
-
-        xrefs: List[int] = []
-        for sec in sections:
-            if not (sec["chars"] & IMAGE_SCN_MEM_EXECUTE):
-                continue
-            start = sec["raw_ptr"]
-            end = min(n, start + sec["raw_size"])
-            if end - start < 8:
-                continue
-            k = target_rva - sec["rva"] + start - 6
-            hit = total == k
-            plain = hit & (p8d >= start) & (p8d <= end - 8)
-            xrefs += (sec["rva"] + p8d[plain] - start).tolist()
-            with_rex = hit & rex & (p8d >= start + 1) & (p8d <= end - 7)
-            xrefs += (sec["rva"] + p8d[with_rex] - start - 1).tolist()
-        return xrefs
-
-    @staticmethod
-    def _rip_xrefs_to_rva_ref(data: bytes, sections, target_rva: int) -> List[int]:
-        """逐字节的慢实现（与 1.2.2.6 及更早版本同逻辑）：既是缺 numpy 时的
-        回退路径，也是自检里给向量化版对拍的参照。"""
-        xrefs: List[int] = []
-        for sec in sections:
-            if not (sec["chars"] & IMAGE_SCN_MEM_EXECUTE):
-                continue
-            start = sec["raw_ptr"]
-            end = min(len(data), start + sec["raw_size"])
-            raw = data[start:end]
-            for i in range(0, max(0, len(raw) - 7)):
-                if 0x40 <= raw[i] <= 0x4F and raw[i + 1] == 0x8D and (raw[i + 2] & 0xC7) == 0x05:
-                    disp = struct.unpack_from("<i", raw, i + 3)[0]
-                    insn_rva = sec["rva"] + i
-                    if insn_rva + 7 + disp == target_rva:
-                        xrefs.append(insn_rva)
-                if raw[i] == 0x8D and (raw[i + 1] & 0xC7) == 0x05:
-                    disp = struct.unpack_from("<i", raw, i + 2)[0]
-                    insn_rva = sec["rva"] + i
-                    if insn_rva + 6 + disp == target_rva:
-                        xrefs.append(insn_rva)
-        return xrefs
-
-    @staticmethod
-    @lru_cache(maxsize=8)
-    def _scan_qaccessible_candidates(dll_path: str) -> Tuple[int, ...]:
-        """按可信度返回全部 gate RVA 候选（越靠前越可能是真 gate）。
-
-        单一候选在版本升级后会漂移，因此返回候选序列：调用方逐个热写并用
-        「mmui 树是否真的物化」判定，成功者记入 _VERIFIED_GATE_RVA。
-
-        结果按 DLL 身份落盘（含「扫过了，没有候选」这个负结果——不支持的版本
-        每次都重扫最浪费）。读不到文件/不是 PE 都返回空序列而不是 None：调用
-        方是直接迭代的。
-        """
-        identity = _dll_identity(dll_path)
-        cached = _gate_cache().get(identity, {}).get("candidates")
-        if isinstance(cached, list):
-            return tuple(int(c) for c in cached)
-
-        try:
-            with open(dll_path, "rb") as f:
-                data = f.read()
-        except OSError:
-            return ()
-
-        sections = WeChatUIA._pe_sections(data)
-        if not sections:
-            return ()
-
-        core_off = data.find(QACCESSIBLE_CORE_STRING)
-        core_rva = WeChatUIA._offset_to_rva(sections, core_off) if core_off >= 0 else None
-        core_xrefs = (WeChatUIA._rip_xrefs_to_rva(data, sections, core_rva)
-                      if core_rva is not None else [])
-
-        candidates: List[Tuple[int, int]] = []
-        for match in QACCESSIBLE_GATE_PATTERN.finditer(data):
-            match_rva = WeChatUIA._offset_to_rva(sections, match.start())
-            disp_rva = WeChatUIA._offset_to_rva(sections, match.start("disp"))
-            if match_rva is None or disp_rva is None:
-                continue
-            match_sec = WeChatUIA._section_for_rva(sections, match_rva)
-            if not match_sec or not (match_sec["chars"] & IMAGE_SCN_MEM_EXECUTE):
-                continue
-
-            cmp_rva = disp_rva - 2              # 80 3d <disp32> 00
-            disp = struct.unpack("<i", match.group("disp"))[0]
-            target_rva = cmp_rva + 7 + disp
-            target_sec = WeChatUIA._section_for_rva(sections, target_rva)
-            if not target_sec or not (target_sec["chars"] & IMAGE_SCN_MEM_WRITE):
-                continue
-
-            if core_xrefs:
-                distance = min(abs(match_rva - xref) for xref in core_xrefs)
-            else:
-                distance = 0x7FFFFFFF
-            candidates.append((distance, target_rva))
-
-        if not candidates:
-            _gate_cache_put(identity, candidates=[])
-            return ()
-        candidates.sort(key=lambda item: item[0])
-        # 优先取与 qt.accessibility.core 同一代码岛（≤0x20000）的候选；
-        # 一个都没有时退化为全部候选，交给热写校验兜底
-        near = [rva for dist, rva in candidates if dist <= 0x20000]
-        ordered = near or [rva for _dist, rva in candidates]
-        result = tuple(dict.fromkeys(ordered))
-        _gate_cache_put(identity, candidates=list(result))
-        return result
-
-    @staticmethod
-    def _scan_qaccessible_active_rva(dll_path: str) -> Optional[int]:
-        """兼容旧接口：返回最优候选（不含校验）。"""
-        cands = WeChatUIA._scan_qaccessible_candidates(dll_path)
-        return cands[0] if cands else None
-
-    @staticmethod
-    def _qaccessible_candidate_rvas(dll_path: str) -> List[int]:
-        """gate RVA 候选序列：已验证缓存 > 特征扫描 > 版本兜底表。"""
-        out: List[int] = []
-        identity = _dll_identity(dll_path)
-        verified = _VERIFIED_GATE_RVA.get(identity)
-        if verified is None:
-            disk = _gate_cache().get(identity, {}).get("verified")
-            if isinstance(disk, int):
-                _VERIFIED_GATE_RVA[identity] = verified = disk
-        if verified is not None:
-            out.append(int(verified))
-        for rva in WeChatUIA._scan_qaccessible_candidates(dll_path):
-            if int(rva) not in out:
-                out.append(int(rva))
-        version = os.path.basename(os.path.dirname(dll_path))
-        fallback = QACCESSIBLE_ACTIVE_RVA_BY_VERSION.get(version)
-        if fallback is not None and int(fallback) not in out:
-            out.append(int(fallback))
-        return out
-
-    @staticmethod
-    def _qaccessible_active_rva(dll_path: str) -> Optional[int]:
-        cands = WeChatUIA._qaccessible_candidate_rvas(dll_path)
-        return cands[0] if cands else None
-
-    @staticmethod
-    def _read_process_byte(handle, address: int) -> Optional[int]:
-        ctypes.windll.kernel32.ReadProcessMemory.argtypes = [
-            wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
-        ctypes.windll.kernel32.ReadProcessMemory.restype = wintypes.BOOL
-        buf = (ctypes.c_ubyte * 1)()
-        read = ctypes.c_size_t(0)
-        ok = ctypes.windll.kernel32.ReadProcessMemory(
-            handle, ctypes.c_void_p(address), buf, 1, ctypes.byref(read))
-        return int(buf[0]) if ok and read.value == 1 else None
-
-    @staticmethod
-    def _write_process_byte(handle, address: int, value: int) -> bool:
-        ctypes.windll.kernel32.WriteProcessMemory.argtypes = [
-            wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
-        ctypes.windll.kernel32.WriteProcessMemory.restype = wintypes.BOOL
-        buf = (ctypes.c_ubyte * 1)(value & 0xFF)
-        written = ctypes.c_size_t(0)
-        ok = ctypes.windll.kernel32.WriteProcessMemory(
-            handle, ctypes.c_void_p(address), buf, 1, ctypes.byref(written))
-        return bool(ok and written.value == 1)
-
-    @staticmethod
-    def _mmui_present(hwnd: int, timeout: float = 1.0) -> bool:
-        """校验窗口是否已物化出 mmui 控件（仍是 Qt 空壳时为 False）。"""
-        deadline = time.time() + max(0.1, timeout)
-        while True:
-            try:
-                c = auto.ControlFromHandle(hwnd)
-            except Exception:
-                c = None
-            if c is not None:
-                if (c.ClassName or "").startswith("mmui::"):
-                    return True
-                try:
-                    kids = c.GetChildren()
-                except Exception:
-                    kids = []
-                for k in kids:
-                    if (k.ClassName or "").startswith("mmui::"):
-                        return True
-            if time.time() >= deadline:
-                return False
-            time.sleep(0.2)
-
-    def _hot_activate_accessibility(self, hwnd: int, verify: bool = True,
-                                    max_candidates: int = 4) -> bool:
-        """运行中热激活 Qt accessibility gate，不重启微信进程。
-
-        verify=True（默认）时对每个候选 RVA 写入后用「mmui 控件是否真的出现」
-        校验：版本升级后 gate RVA 会漂移，校验失败即回滚该字节并尝试下一个
-        候选；成功则按 DLL 身份记入 _VERIFIED_GATE_RVA（下次优先使用）。
-        """
-        pid = self._pid_from_hwnd(hwnd)
-        if not pid:
-            return False
-        mod = self._weixin_dll_module(pid)
-        if not mod:
-            wxlog.warning("热激活 UIA 失败：PID %s 未找到 Weixin.dll。", pid)
-            return False
-        base, _size, dll_path = mod
-        candidates = self._qaccessible_candidate_rvas(dll_path)[:max_candidates]
-        if not candidates:
-            wxlog.warning("热激活 UIA 失败：不支持的 Weixin.dll 版本路径 %s。", dll_path)
-            return False
-
-        access = (PROCESS_QUERY_INFORMATION | PROCESS_VM_READ |
-                  PROCESS_VM_WRITE | PROCESS_VM_OPERATION)
-        kernel32 = ctypes.windll.kernel32
-        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        handle = kernel32.OpenProcess(access, False, pid)
-        if not handle:
-            wxlog.warning("热激活 UIA 失败：无法打开 Weixin.exe PID %s。", pid)
-            return False
-        try:
-            for rva in candidates:
-                address = int(base) + int(rva)
-                current = self._read_process_byte(handle, address)
-                if current is None:
-                    continue
-                wrote = False
-                original = current
-                if current != 1:
-                    if not self._write_process_byte(handle, address, 1):
-                        continue
-                    wrote = True
-                    wxlog.info("热激活 UIA：PID=%s Weixin.dll+0x%x: %s -> 1",
-                               pid, rva, current)
-                if not verify:
-                    return True
-                if self._mmui_present(hwnd):
-                    identity = _dll_identity(dll_path)
-                    _VERIFIED_GATE_RVA[identity] = int(rva)
-                    _gate_cache_put(identity, verified=int(rva))
-                    wxlog.info("UIA 树已物化，已记录 gate RVA：Weixin.dll+0x%x", rva)
-                    return True
-                # 候选不对：恢复原值，继续试下一个
-                if wrote:
-                    self._write_process_byte(handle, address, original)
-            wxlog.warning("热激活 UIA 失败：%d 个候选均未使 mmui 树物化（%s）。",
-                          len(candidates), os.path.basename(dll_path))
-            return False
-        finally:
-            kernel32.CloseHandle(handle)
-
     def _wake_accessibility(self) -> bool:
         """确保 mmui 树物化：设系统读屏标志 + 逐窗口热写并校验（含候选重试）。
 
@@ -796,17 +298,58 @@ class WeChatUIA:
         ``ensure_window``，把 ``quick_send`` 整个打断（用户实测崩在 198MB DLL 的
         扫描循环里）。KeyboardInterrupt 属于 BaseException，不在此列，照常中断。
         """
-        self._set_screen_reader_flag(True)
         ok = False
         for hwnd in self._wechat_hwnds():
             try:
                 ok = self._hot_activate_accessibility(hwnd) or ok
             except Exception as e:
                 wxlog.warning("热激活 UIA 异常，本轮跳过（改用 OCR/坐标定位）：%s", e)
+        if not ok:
+            # 字节那条路走不通（不认识的结构/扫描失败）才动系统标志：真机对照过，
+            # 树只跟 gate 字节走，读屏标志是全系统级开关，别在常规路径上顺手开。
+            self._set_screen_reader_flag(True)
         if ok:
             self._win = None
             time.sleep(0.2)
         return ok
+
+    # ------------------------------------------------------------------ 热激活
+    # gate 本体挪到了 wechatauto.accessibility（扫 RVA / 写进程内存 / 校验），
+    # 这里只留同名转发：调用方和离线自检一个字都不用改，而且 _wake_accessibility
+    # 依旧走 self.，所以「worker 被换掉时它要能看见」那条判据仍然成立。
+    _set_screen_reader_flag = staticmethod(_acc.AccessibilityGate._set_screen_reader_flag)
+    _pid_from_hwnd = staticmethod(_acc.AccessibilityGate._pid_from_hwnd)
+    _process_modules = staticmethod(_acc.AccessibilityGate._process_modules)
+    _weixin_dll_module = classmethod(
+        lambda cls, pid: _acc.AccessibilityGate._weixin_dll_module(pid))
+    _mmui_present = staticmethod(_acc.AccessibilityGate._mmui_present)
+    # 离线自检直接拿这几个当被测函数（PE 扫描的等价性/容错），保留同名入口
+    _pe_sections = staticmethod(_acc.AccessibilityGate._pe_sections)
+    _section_for_rva = staticmethod(_acc.AccessibilityGate._section_for_rva)
+    _offset_to_rva = staticmethod(_acc.AccessibilityGate._offset_to_rva)
+    _rip_xrefs_to_rva = staticmethod(_acc.AccessibilityGate._rip_xrefs_to_rva)
+    _rip_xrefs_to_rva_ref = staticmethod(_acc.AccessibilityGate._rip_xrefs_to_rva_ref)
+    _scan_qaccessible_candidates = staticmethod(
+        _acc.AccessibilityGate._scan_qaccessible_candidates)
+    _scan_qaccessible_active_rva = staticmethod(
+        _acc.AccessibilityGate._scan_qaccessible_active_rva)
+    _qaccessible_candidate_rvas = staticmethod(
+        _acc.AccessibilityGate._qaccessible_candidate_rvas)
+    _qaccessible_active_rva = staticmethod(_acc.AccessibilityGate._qaccessible_active_rva)
+    _read_process_byte = staticmethod(_acc.AccessibilityGate._read_process_byte)
+    _write_process_byte = staticmethod(_acc.AccessibilityGate._write_process_byte)
+
+    def _hot_activate_accessibility(self, hwnd: int, verify: bool = True,
+                                    max_candidates: int = 4) -> bool:
+        return _acc.AccessibilityGate._hot_activate_accessibility(
+            hwnd, verify=verify, max_candidates=max_candidates)
+
+    @staticmethod
+    def gate_block_hint(diag: dict, bits: Optional[int] = None) -> str:
+        return _acc.gate_block_hint(diag, bits)
+
+    def _warn_gate_blocked(self, diag: dict) -> None:
+        _acc.warn_gate_blocked(diag)
 
     # ------------------------------------------------------------------ 窗口定位
     def _wechat_hwnds(self, diag: Optional[dict] = None):
@@ -849,40 +392,6 @@ class WeChatUIA:
             pass
         res.sort(reverse=True)
         return [h for _, h in res]
-
-    @staticmethod
-    def gate_block_hint(diag: dict, bits: Optional[int] = None) -> str:
-        """把「扫不到可用窗口」翻译成一句能定位的话（纯函数，便于离线自检）。"""
-        if bits is None:
-            bits = ctypes.sizeof(ctypes.c_void_p) * 8
-        matched = (diag or {}).get('matched', 0)
-        kept = (diag or {}).get('kept', 0)
-        if (diag or {}).get('win32', True) is False:
-            return ("pywin32 不可用，UIA 驱动整条路都用不了（安装：pip install pywin32）")
-        if matched == 0:
-            return ("没扫到可见的微信主窗口：微信未启动/未登录/最小化到托盘，"
-                    "或窗口标题不再包含「微信/Weixin」。UIA 这条路不会自己出现控件树。")
-        if kept == 0:
-            return ("扫到 %d 个微信窗口，但每个都定位不到 Weixin.dll 模块，热激活无从下手。"
-                    "当前解释器是 %d 位。%s"
-                    % (matched, bits,
-                       ("32 位 Python 无法枚举 64 位进程的模块（ERROR_PARTIAL_COPY），"
-                        "请改用 64 位 Python。" if bits == 32 else
-                        "64 位下还拿不到模块，通常是权限/完整性级别不一致"
-                        "（别用「以管理员身份运行」，让脚本与微信同级）"
-                        "或安全软件拦了模块枚举/进程读取——把 python 加入白名单再试。")))
-        return ""
-
-    def _warn_gate_blocked(self, diag: dict) -> None:
-        """同一种原因一个进程只说一次：长驻进程每次轮询都扫，刷屏比不说更糟。"""
-        hint = self.gate_block_hint(diag)
-        if not hint:
-            return
-        key = hint.split('。')[0][:40]
-        if key in _GATE_BLOCK_WARNED:
-            return
-        _GATE_BLOCK_WARNED.add(key)
-        wxlog.warning("控件树拿不到（本轮不会热激活 gate）：%s", hint)
 
     def _anchor(self, hwnd):
         try:

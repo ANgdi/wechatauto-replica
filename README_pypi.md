@@ -32,9 +32,9 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.6.1
+> 当前版本：1.2.7.0
 >
-> **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.13 验证）
+> **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.53 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
 > 布局，UIA 控件树随小版本变化——4.1.15 起搜索入口改为收起式，已适配；
 > 其它小版本可能需校准 `guia.py` 布局常量与 gate RVA 表）。
@@ -95,6 +95,20 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 ---
 
 ## 版本记录
+
+### v1.2.7.0（2026-10-17）
+
+- **新增：改联系人备注——`wx.RenameMember("小明", "高中同学")` / `wechatauto 备注 小明 --to "高中同学"`。** 这是第一个会**写账号数据**的功能，所以有三处是刻意的：
+  - 路径是「通讯录 → 点开联系人 → 资料页『更多』→『设置备注和标签』」，与通讯录标签功能共用同一套窗口层脚手架（`wechatauto/remark.py`，`RemarkOps` 继承 `LabelOps`）：抬窗、落点归属校验、独立小窗枚举全部复用。
+  - 改完按**这个联系人的 username** 回读 `contact.db` 的 `remark` 字段确认；回读不通过就报失败，绝不报成功。
+  - 清空备注必须显式 `--clear` / `allow_empty=True`，免得漏个参数就把人家的备注抹掉。`wechatauto 备注 小明 --probe` 走同一条路、打开编辑窗后立刻关掉、不写任何东西——微信界面改版时用它定位断在哪一步。
+- **新增：发送后回读数据库的间隔可调。** `WxParam.DB_VERIFY_INTERVAL`（默认 1.0 秒）与 `WxParam.DB_VERIFY_TIMEOUT`（默认 8.0 秒，设 0 = 只读一次），命令行对应 `send` / `labels send` / `forward` 的 `--verify-interval` 与 `--verify-timeout`。默认值就是这轮之前写死的那两个数，行为不变。失败文案现在会说明等了多久（`数据库未确认（等了 8s）`）。
+- **新增：`tools/wake_uia.py`——不依赖本库，单独热激活/关闭 UIA 控件树。** `--status` 只报告，`--off` 把字节写回 0，`--rva 0x…` 跳过扫描。与库共用同一份 RVA 缓存文件，扫描成本只付一次。
+- **内部：Qt 无障碍闸门独立成模块**（`wechatauto/accessibility.py`），`uia_driver` 保留同名转发，调用方无需改动。同时修掉两个一直在**静默破坏热激活**的问题：
+  - `_HAS_WIN32` 与 `uiautomation` 别名在搬家时没跟过去，被外层 `except` 吞掉，表现为「扫到微信窗口但定位不到 Weixin.dll」和「N 个候选均未使 mmui 树物化」——等于每次激活都在把自己写进去的字节回滚。
+  - 系统「屏幕阅读器」标志用的 SPI 常量是错的（`0x0046/0x0047` 是键盘首选项那一对），**而且**值放在了错误的实参位置；Windows 直接返回 `FALSE` + err=87，也就是说这个标志从来没有真正设上过。六臂换进程对照实测：树只跟 gate 字节走，所以现在只在字节那条路走不通时才碰它。
+- **新增：微信 4.1.15.53 适配**——版本表补上 gate RVA `0x0B3959D8`（真机扫描得出并验证：写 1 树变 `mmui::MainWindow`，写 0 掉回 `Qt51514QWindowIcon`）。
+- 判定：`561` 项离线自检 + 标签 `98` + 转发 `59` 全绿；改备注在真机上跑通两轮完整回环（设备注 → 落库确认 → 清空 → 落库确认为空）。
 
 ### v1.2.6.1（2026-10-10）
 
@@ -1207,6 +1221,20 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.7.0 (2026-10-17)
+
+- **New: set a contact's remark — `wx.RenameMember("Bob", "high school")` / `wechatauto 备注 Bob --to "high school"`.** This is the first feature that writes to your account data, so three things are deliberate:
+  - The path is Contacts → open a contact → profile "More" → "Remark & Tags", reusing the same window/click scaffolding as the contact-label feature (`wechatauto/remark.py`, `RemarkOps` extends `LabelOps`) — lifted windows, click-ownership checks and independent-popup enumeration all shared.
+  - The result is confirmed by reading the `remark` column back **for that contact's username** out of `contact.db`; a failed read-back is reported as failure, never as success.
+  - Clearing a remark needs an explicit `--clear` / `allow_empty=True`, so a forgotten argument cannot wipe someone's remark. `wechatauto 备注 Bob --probe` walks the same path, opens the editor and closes it without writing anything — use it to find which step broke when WeChat's UI shifts.
+- **New: the post-send database read-back interval is configurable.** `WxParam.DB_VERIFY_INTERVAL` (default 1.0 s) and `WxParam.DB_VERIFY_TIMEOUT` (default 8.0 s; 0 = single read), with `--verify-interval` / `--verify-timeout` on `send`, `labels send` and `forward`. The defaults are exactly the two numbers that used to be hard-coded, so behaviour is unchanged. The failure text now states how long it waited (`数据库未确认（等了 8s）`).
+- **New: `tools/wake_uia.py` — activate or drop the UIA control tree without depending on this library.** `--status` only reports, `--off` flips the byte back, `--rva 0x…` skips the scan. It shares the same RVA cache file, so the scan cost is paid once.
+- **Internal: the Qt accessibility gate is its own module** (`wechatauto/accessibility.py`), with same-name forwarding from `uia_driver` kept so no caller changes. Two defects that were silently breaking hot activation are fixed:
+  - `_HAS_WIN32` and the `uiautomation` alias were left behind during the move and swallowed by an outer `except`, showing up as "found a WeChat window but could not locate Weixin.dll" and "N candidates did not materialize the mmui tree" — i.e. every activation rolled its own byte back.
+  - The screen-reader system flag used the wrong SPI constants (`0x0046/0x0047` are the keyboard-preference pair) **and** passed the value in the wrong argument; Windows rejected it with `FALSE` + err=87, so the flag had never actually been set. A six-arm fresh-process A/B showed the tree follows the gate byte alone, so the flag is now touched only when the byte path fails.
+- **New: WeChat 4.1.15.53 support** — gate RVA `0x0B3959D8` added to the version table (scanned and verified on a live client: writing it flips the tree to `mmui::MainWindow`, clearing it drops back to `Qt51514QWindowIcon`).
+- Verified: 561 offline checks + 98 label + 59 forward green; the remark path completed two full live round-trips (set → confirmed in the DB → clear → confirmed empty).
 
 ### v1.2.6.1 (2026-10-10)
 

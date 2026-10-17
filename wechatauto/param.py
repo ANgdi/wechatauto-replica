@@ -26,6 +26,16 @@ class WxParam:
     # 监听消息时间间隔，单位秒
     LISTEN_INTERVAL: int = 1
 
+    # 发送后回读数据库确认「这条真落库了」的轮询间隔与等待上限，单位秒。
+    # 微信写库是异步的（还要 checkpoint/WAL 合并），一次读不到不等于没发出去，
+    # 所以这里本来就是「先读一次，没有就隔 DB_VERIFY_INTERVAL 再读，最多读到
+    # DB_VERIFY_TIMEOUT」。默认值就是这套逻辑一开始写死的 1 秒 / 8 秒。
+    # 调大的场景：机器慢、群多、库里消息多，解密+查询本身要几百毫秒到几秒；
+    # 调小的场景：批量发送想要快反馈（注意每读一次都是一次真解密，别调到 0 附近）。
+    # 上限到 0 表示「只读一次就判」，与老的 verify=False 之外的最省行为一致。
+    DB_VERIFY_INTERVAL: float = 1.0
+    DB_VERIFY_TIMEOUT: float = 8.0
+
     # 监听执行器线程池大小
     LISTENER_EXCUTOR_WORKERS: int = 4
 
