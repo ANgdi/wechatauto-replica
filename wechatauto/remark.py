@@ -101,7 +101,7 @@ class RemarkOps(LabelOps):
         return self._click(owner or hwnd, ctrl, right=right, raise_it=False)
 
     def _row_named(self, win, who: str):
-        """当前这一屏里找显示名等于/包含 ``who`` 的行。"""
+        """只接受精确显示名；屏内相似项不能抢先于屏外的真正目标。"""
         rows = self._rows(win, CONTACT_ITEM_CLS)
         who = (who or "").strip()
         if not who:
@@ -109,12 +109,6 @@ class RemarkOps(LabelOps):
         for row in rows:
             try:
                 if (row.Name or "").strip() == who:
-                    return row
-            except Exception:
-                continue
-        for row in rows:                       # 退一步：包含匹配（名字带后缀/表情）
-            try:
-                if who in (row.Name or ""):
                     return row
             except Exception:
                 continue
@@ -158,7 +152,7 @@ class RemarkOps(LabelOps):
 
     def find_contact_row(self, win, who: str, max_screens: int = 40,
                          notches: int = 8):
-        """通讯录左栏找 ``who``：先看当前屏，不在就回顶再一屏屏往下滚着找。
+        """通讯录左栏精确找 ``who``：当前屏没有就回顶继续查找，不做包含匹配。
 
         一格滚轮实测只走 1~2 行（``-600`` 那种大把经常一点不动），所以每轮滚
         ``notches`` 格、轮数给足：174 个联系人 ≈ 150 行，40 轮 × 8 格留够余量。
@@ -302,7 +296,7 @@ class RemarkOps(LabelOps):
 
         ``new_remark`` 为空表示**清空备注**，必须显式 ``allow_empty=True``
         （否则空串多半是调用方漏了参数，不该悄悄把人家的备注抹掉）。
-        ``verify=True`` 时回读 ``contact.db`` 的 remark 字段确认。
+        写入前必须能唯一解析精确显示名；``verify=True`` 再回读数据库确认结果。
         """
         who = (who or "").strip()
         new_remark = (new_remark or "").strip()
@@ -313,6 +307,8 @@ class RemarkOps(LabelOps):
         # 先在操作**之前**把 username 定下来：改完备注后显示名会变成新备注，
         # 那时再想反查就难了（清空那次更是无迹可寻）。
         uname = self._username_of(who)
+        if not uname:
+            return _result(False, "no-exact-contact：无法唯一确认完整显示名对应的联系人，未修改备注")
         op = self.open_profile(who)
         if not op["ok"]:
             return op
@@ -330,6 +326,10 @@ class RemarkOps(LabelOps):
             return _result(False, "no-edit-window：点了「%s」但编辑窗没出现" % MENU_SET_REMARK)
         try:
             before = self._current_remark(edit_win)
+            # 导航途中资料页可能变化；编辑窗显示的旧备注必须仍是所选显示名。
+            if before != who:
+                return _result(False, "target-mismatch：编辑窗不是指定联系人，未修改备注",
+                               who=who, before=before)
             typed = self._type_remark(edit_win, new_remark)
             if not typed["ok"]:
                 self._close_edit_windows()
@@ -350,10 +350,6 @@ class RemarkOps(LabelOps):
 
         out = {"who": who, "remark": new_remark, "before": before}
         if verify:
-            if not uname:
-                return _result(False, "no-username：解析不出这个联系人的 username，"
-                                      "没法回读验证（界面上的改动已经做了，请自己看一眼）",
-                               **out)
             ok = self._remark_landed(uname, new_remark)
             out["verified"] = ok
             if not ok:
@@ -490,18 +486,16 @@ class RemarkOps(LabelOps):
             user32.PostMessageW(h, WM_CLOSE, 0, 0)
 
     def _username_of(self, who: str) -> Optional[str]:
-        """把显示名解析成 username（备注/昵称/username 任一相等即可）。"""
+        """按通讯录实际显示名唯一解析；有备注时不能拿被遮盖的昵称认人。"""
         try:
             hits = self.db.search_contact(who) or []
         except Exception as e:
             wxlog.debug("联系人解析失败：%s", e)
             return None
-        for h in hits:
-            if (h.get("username") or "") == who \
-                    or (h.get("remark") or "").strip() == who \
-                    or (h.get("nick_name") or "").strip() == who:
-                return h.get("username")
-        return hits[0].get("username") if hits else None
+        usernames = {h.get("username") for h in hits
+                     if (h.get("remark") or h.get("nick_name") or "").strip() == who
+                     and h.get("username")}
+        return next(iter(usernames)) if len(usernames) == 1 else None
 
     def _remark_landed(self, uname: str, new_remark: str, timeout: float = 6.0) -> bool:
         """按 **username** 回读 contact.db 的 remark（空串 = 已清空）。
