@@ -1673,17 +1673,43 @@ class WeChatGUI:
     # ------------------------------------------------------------------
     # 输入框
     # ------------------------------------------------------------------
+    def _uia_input_box(self) -> Optional[Tuple[int, int, int, int]]:
+        """读取当前窗口的聊天编辑框，转换为渲染相对坐标。"""
+        try:
+            from wechatauto.uia_driver import CHAT_INPUT_AIDS, _aid_hit
+            uia = self._get_uia()
+            if uia is None or uia._win is None:
+                return None
+            # 多开时 UIA 可能找到另一主窗，不能借用它的坐标。
+            if int(uia._win.NativeWindowHandle) != self.main_hwnd:
+                return None
+            edit = uia._chat_input()
+            if (edit is None or edit.IsOffscreen
+                    or not _aid_hit(edit.AutomationId or '', CHAT_INPUT_AIDS)):
+                return None
+            rect = edit.BoundingRectangle
+            box = (rect.left - self.origin_x, rect.top - self.origin_y,
+                   rect.right - self.origin_x, rect.bottom - self.origin_y)
+            x0, y0, x1, y1 = box
+            if 0 <= x0 < x1 <= self.render_w and 0 <= y0 < y1 <= self.render_h:
+                return box
+        except Exception as exc:
+            wxlog.debug('读取聊天输入控件位置失败：%s', exc)
+        return None
+
     def get_input_box(self) -> Optional[Tuple[int, int, int, int]]:
         """自适应输入框检测，返回渲染相对矩形 (x0,y0,x1,y1)。
 
-        原理：输入框是右侧面板底部一块**全宽浅色区**，与上方消息区以一条
+        优先读取当前窗口的真实 UIA 聊天编辑框；不可用时再做像素探测。
+        输入框是右侧面板底部一块**全宽浅色区**，与上方消息区以一条
         约 2px 的浅灰边框线 ((224,224,224)) 分隔。先取若干探针行（自下而上
         在输入框下半部找一行，要求该行在 right_pane_left..render_w 范围内
         白度 >=0.8），再从探针行向上/向下扫描中心竖线确定输入框上下边界。
         探测失败返回 None（不再回退到默认布局，避免在错误坐标上误点）。
         """
+        self._update_render_rect()
         for _ in range(6):
-            box = self._probe_input_box()
+            box = self._uia_input_box() or self._probe_input_box()
             if box:
                 return box
             time.sleep(0.5)
@@ -1696,16 +1722,13 @@ class WeChatGUI:
             wxlog.info('输入框探测连续失败，自动重新校准布局…')
             self.calibrate_layout()
             for _ in range(3):
-                box = self._probe_input_box()
+                box = self._uia_input_box() or self._probe_input_box()
                 if box:
                     return box
                 time.sleep(0.5)
                 self._update_render_rect()
         wxlog.debug('未检测到输入框')
-        # 兜底：输入框与底部工具栏高度固定，窗口缩放只改变消息区高度。
-        # 实测本机输入框上边 ≈ render_h-391、下边 ≈ render_h-150。
-        return (self.right_pane_left, self.render_h - int(self.render_h * 0.214),
-                self.render_w, self.render_h - int(self.render_h * 0.082))
+        return None
 
     def _probe_input_box(self) -> Optional[Tuple[int, int, int, int]]:
         """探针法定位输入框，失败返回 None。
@@ -1885,7 +1908,10 @@ class WeChatGUI:
         if not box:
             return False
         x0, y0, x1, y1 = box
-        rel = (x0 + 20, y0 + 10, x1 - 20, y0 + 200)
+        # UIA 返回的是编辑控件本身；不能越过它把工具栏图标算成残留文字。
+        rel = (x0 + 20, y0 + 10, x1 - 20, min(y1, y0 + 200))
+        if rel[0] >= rel[2] or rel[1] >= rel[3]:
+            return False
         img = self._grab_screen(self._rel_to_screen(rel))
         px = img.load()
         dark = sum(1 for y in range(0, img.size[1], 2) for x in range(0, img.size[0], 2)
