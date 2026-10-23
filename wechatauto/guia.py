@@ -2541,26 +2541,34 @@ class WeChatGUI:
                   target_text: Optional[str] = None, verify: bool = False) -> WxResponse:
         """引用指定/最近一条消息（右键 → 菜单「引用」→ 输入 → 发送）。
 
-        target_text 用于 OCR 定位要引用的消息文案（可选）；省略时引用最近一条。
+        target_text 与 OCR 使用相同的空格处理；匹配多条时失败，避免引用错人。
+        省略 target_text 时引用最近一条。
         """
         # 引用消息落库的正文里还包着被引用那条，只能包含匹配；水位见 _send_watermark。
         mark = self._send_watermark(who) if verify else None
         if not self.ensure_visible():
             return WxResponse.failure('微信窗口不可见（可能锁屏/会话断开）')
         if who:
-            self.open_chat(who)
+            if not self.open_chat(who):
+                return WxResponse.failure(f'无法打开会话：{who}')
             time.sleep(0.8)
         box = self.get_input_box()
-        msg_bottom = box[1] if box else int(self.render_h * 0.8)
+        if box is None:
+            return WxResponse.failure('未检测到聊天输入框，无法确定消息扫描范围')
+        msg_bottom = box[1]
         if target_text:
             items = self.ocr((self.right_pane_left, 100, self.render_w, msg_bottom))
-            pt = None
-            for t, x, yy, w, h in items:
-                if target_text in t:
-                    pt = (x + w // 2, yy + h // 2)
-                    break
-            if not pt:
+            # ScreenOCR 会去掉 ASCII 空格，调用参数必须采用相同规则。
+            target = target_text.replace(' ', '')
+            if not target.strip():
+                return WxResponse.failure('要引用的消息文字不能为空白')
+            matches = [(x + w // 2, yy + h // 2) for t, x, yy, w, h in items
+                       if target in t.replace(' ', '')]
+            if not matches:
                 return WxResponse.failure(f'未找到要引用的消息：{target_text}')
+            if len(matches) != 1:
+                return WxResponse.failure('多条可见文字匹配引用目标，无法唯一定位要引用的消息')
+            pt = matches[0]
         else:
             y = self._last_message_y()
             if y is None:
@@ -2574,19 +2582,28 @@ class WeChatGUI:
         # 右键不响应，SendInput 可直接命中弹出菜单（原图那次的同类修复）。
         self._input.send_input_click(self.origin_x + pt[0], self.origin_y + pt[1], right=True)
         time.sleep(0.7)
-        menu = self.ocr((self.right_pane_left, max(80, pt[1] - 200), self.render_w, self.render_h))
-        click_pt = None
-        for t, x, yy, w, h in menu:
-            if '引用' in t:
-                click_pt = rhythm.point((x, yy, x + w, yy + h))
-                break
-        if not click_pt:
-            return WxResponse.failure('未找到「引用」菜单项')
-        self.wx_click(self.origin_x + click_pt[0], self.origin_y + click_pt[1])
+        # OCR 可能把「引用」和相邻菜单行的坐标合并，优先复用真实菜单控件。
+        uia = self._get_uia()
+        item = None
+        if uia is not None and uia._win is not None:
+            if int(uia._win.NativeWindowHandle) == self.main_hwnd:
+                item = uia._uia_find_menu_item('引用')
+        if item is not None:
+            if not uia._uia_click_menu_item(item):
+                return WxResponse.failure('点击「引用」菜单项失败')
+        else:
+            menu = self.ocr((self.right_pane_left, max(80, pt[1] - 200), self.render_w, self.render_h))
+            # 只接受菜单文字本身，正文中含「引用」不能当作菜单项。
+            matches = [(x, yy, x + w, yy + h) for t, x, yy, w, h in menu if t.strip() == '引用']
+            if len(matches) != 1:
+                return WxResponse.failure('未唯一定位到「引用」菜单项')
+            click_pt = rhythm.point(matches[0])
+            self.wx_click(self.origin_x + click_pt[0], self.origin_y + click_pt[1])
         time.sleep(0.8)
         if not self.input_text(text):
             return WxResponse.failure('输入引用内容失败')
-        self.click_send()
+        if not self.click_send():
+            return WxResponse.failure('引用内容未通过发送前检查或发送失败')
         if verify:
             ok = self._verify_sent(text, who, mode='contains', after=mark)
             return (WxResponse.success(f'引用已发送并确认：{text}', data={'content': text})
