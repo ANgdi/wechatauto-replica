@@ -103,6 +103,16 @@ MAIN_CLASSES = ("mmui::MainWindow",)
 LOGIN_CLASSES = ("mmui::LoginWindow",)
 MAIN_NAME_HINTS = ("微信", "Weixin")               # 标题按“包含”匹配（新版可能带未读数）
 SEARCH_EDIT_CLASSES = ("mmui::XValidatorTextEdit",)
+# 「搜索」输入框在 4.1.15 有三处：左上会话搜索、聊天记录搜索、群成员面板搜索。
+# 只有**会话搜索**能打开会话；后两处都在 ChatDetailView 子树里，误选它们会让
+# open_chat 把词打进聊天搜索/群成员搜索里，然后报「会话打不开」。
+SEARCH_EDIT_EXCLUDE_ANCESTORS = (
+    "mmui::ChatDetailView",
+    "mmui::ChatMessagePage",
+    "mmui::ChatTitleBarMasterView",
+    "mmui::ChatRoomMemberInfoView",
+    "mmui::ChatInfoView",
+)
 SESSION_LIST_AIDS = ("session_list",)
 SEARCH_LIST_AIDS = ("search_list",)
 CHAT_INPUT_AIDS = ("chat_input_field",)
@@ -769,6 +779,36 @@ class WeChatUIA:
         self._click_at(x, y, right=right)
         return True
 
+    def _raw_click_ctrl(self, ctrl) -> bool:
+        """不做「摘 WS_EX_TRANSPARENT」那一步的兜底点击，但**仍走拟人落点与轨迹**。
+
+        2026-10-23 实测（主窗最大化、停在朋友圈页）：``_click_ctrl`` 那条
+        「临时摘掉 WS_EX_TRANSPARENT」的流程在这个布局下会把点击吃掉，连点
+        4 次导航栏都不切页；裸 ``mouse_event`` 一次就切回去了。这里只省掉
+        摘透明层，落点仍用 :func:`rhythm.point`（控件内随机点）、光标仍用
+        :func:`rhythm.move_to` 走过去、等待仍用 :func:`rhythm.nap`。
+        只在常规路径全部失败后调用，不改变日常点击策略。
+        """
+        try:
+            r = ctrl.BoundingRectangle
+        except Exception:
+            return False
+        if not r or r.width() <= 0 or r.height() <= 0:
+            return False
+        x, y = rhythm.point((r.left, r.top, r.right, r.bottom))
+        try:
+            self._force_foreground(self._win.NativeWindowHandle)
+            u = ctypes.windll.user32
+            rhythm.move_to(u, int(x), int(y))
+            rhythm.nap(0.12)
+            u.mouse_event(0x0002, 0, 0, 0, 0)
+            rhythm.nap(0.06)
+            u.mouse_event(0x0004, 0, 0, 0, 0)
+            rhythm.nap(0.2)
+            return True
+        except Exception:
+            return False
+
     def _wheel_at(self, x: int, y: int, delta: int) -> None:
         self._set_cursor(x, y)
         rhythm.nap(0.1)
@@ -786,18 +826,55 @@ class WeChatUIA:
                         and "Button" in c.ControlTypeName, max_depth=40)
 
     def _search_box_present(self, win):
-        """搜索框已经展开时的定位（4.1.13 及以前它常驻）。"""
-        # 1) 已知锚点（类名+名称 / 名称 / 类名），遍历候选类名
-        for cls in SEARCH_EDIT_CLASSES:
-            for kw in (dict(ClassName=cls, Name=SEARCH_EDIT_NAME),
-                       dict(Name=SEARCH_EDIT_NAME),
-                       dict(ClassName=cls)):
-                e = win.EditControl(**kw)
-                if e.Exists(1.0, 0.2):
-                    return e
+        """搜索框已经展开时的定位（4.1.13 及以前它常驻）。
+
+        4.1.15 的树里可能同时有三颗 Name='搜索' 的 Edit：
+        左上会话搜索、聊天记录搜索、群成员面板搜索。**必须优先会话搜索框**，
+        否则 open_chat 的词会被打进聊天内搜索里（实测：群信息面板开着时必然踩），
+        然后搜不到任何会话。判据用祖先类名，不靠坐标/版本号。
+        """
+        cands = []
+        try:
+            for c, _d in auto.WalkControl(win, maxDepth=40):
+                try:
+                    if (c.ControlTypeName == "EditControl"
+                            and SEARCH_EDIT_NAME in (c.Name or "")):
+                        cands.append(c)
+                except Exception:
+                    continue
+        except Exception as e:
+            # 微信正在重绘/关窗时，遍历会撞上失效元素（COMError: 元素不可用）。
+            # 已经拿到的候选照常用，后面的 _find_by 兜底也会再试一次。
+            wxlog.debug("遍历搜索框时元素失效：%s", e)
+        if cands:
+            def rank(c):
+                try:
+                    left = c.BoundingRectangle.left
+                except Exception:
+                    left = 1 << 30
+                return (1 if self._in_chat_scope(c) else 0, left)
+            return min(cands, key=rank)
         # 2) 新旧版兜底：Name 含“搜索”的编辑框（忽略类名变化）
         return _find_by(win, lambda c: (c.ControlTypeName == "EditControl"
                                         and SEARCH_EDIT_NAME in (c.Name or "")))
+
+    @staticmethod
+    def _in_chat_scope(ctrl) -> bool:
+        """控件是否在右侧聊天区（聊天记录/群成员面板）里。"""
+        cur = ctrl
+        for _ in range(10):
+            try:
+                cur = cur.GetParentControl()
+            except Exception:
+                return False
+            if cur is None:
+                return False
+            try:
+                if (cur.ClassName or "") in SEARCH_EDIT_EXCLUDE_ANCESTORS:
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _search_box(self, win, expand: bool = False):
         """定位搜索输入框。
@@ -861,19 +938,27 @@ class WeChatUIA:
     def _find_search_list(self, timeout: float = 3.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            # 1) 旧版：aid 短名
-            lst = auto.ListControl(searchDepth=0xFFFFFFFF, AutomationId=SEARCH_LIST_AID)
-            if lst.Exists(0.2, 0.1):
-                return lst
+            # 1) 旧版：aid 短名。``Exists`` 会自己走一遍桌面树，微信重绘时会抛
+            #    COMError（元素不可用），不能让这一下把 open_chat 整个打断。
+            try:
+                lst = auto.ListControl(searchDepth=0xFFFFFFFF, AutomationId=SEARCH_LIST_AID)
+                if lst.Exists(0.2, 0.1):
+                    return lst
+            except Exception as e:
+                wxlog.debug("搜索下拉(旧锚点)读取失败：%s", e)
             # 2) 新版：aid 点分路径 → 从根节点按属性容错匹配
             try:
                 root = auto.GetRootControl()
             except Exception:
                 root = None
-            hit = _find_by(root, lambda c: (c.ControlTypeName == "ListControl"
-                                            and _aid_hit(getattr(c, "AutomationId", ""),
-                                                         SEARCH_LIST_AIDS)),
-                           max_depth=25)
+            try:
+                hit = _find_by(root, lambda c: (c.ControlTypeName == "ListControl"
+                                                and _aid_hit(getattr(c, "AutomationId", ""),
+                                                             SEARCH_LIST_AIDS)),
+                               max_depth=25)
+            except Exception as e:
+                wxlog.debug("搜索下拉(新锚点)读取失败：%s", e)
+                hit = None
             if hit is not None:
                 return hit
             time.sleep(0.2)
@@ -1026,6 +1111,19 @@ class WeChatUIA:
                 return True
         # 点满还不算退出：窄窗口开着会话时搜索框不在树里，这一步不补点的话
         # open_chat 的搜索框查找会直接失败，报出来的就是「会话打不开」。
+        # 新布局（最大化 + 竖排导航）下常规点击会被渲染层吃掉，且切页后的
+        # 会话列表是懒渲染：点一次后要按 2.5s 轮询判据，仍不行再点一次
+        # （人手遇到没反应的 tab 也会再点一下）。
+        for attempt in (1, 2):
+            if not self._raw_click_ctrl(item):
+                break
+            deadline = time.time() + 2.5
+            while time.time() < deadline:
+                rhythm.nap(0.35)
+                if _ready():
+                    wxlog.info("常规点击切不回聊天页，按拟人落点直接点击 %d 次后成功",
+                               attempt)
+                    return True
         wxlog.warning("点了 %d 次导航栏「%s」，会话列表和搜索框还是不在树里——"
                       "主窗大概率还开着会话（窄窗口点一次退不出去），"
                       "后面按搜索框/会话列表走的动作会失败",

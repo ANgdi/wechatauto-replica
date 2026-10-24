@@ -17,7 +17,7 @@
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.7.0 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.53)
+> **Current version:** 1.2.8.0 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.53)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 
@@ -217,6 +217,16 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 - Performance: parallel export / first-scan, incremental memory-scan cache
 
 ## 📝 Changelog
+
+### v1.2.8.0 (2026-10-23)
+
+- **New: add a group member as a friend — `wx.AddFriendFromGroup("Group", "Bob")` / `wechatauto 加好友 群名 成员名`.** UIA path: open the group → “Chat info” (top-right) → the “Search group members” box → open the result card → “Add to contacts” → “Send”.
+  - **Search results are chosen by screen position, not tree order.** A name can hit several rows, and Qt's recycler list exposes its children in a different order from what you see; the previous “first match while walking the tree” opened the wrong (bottom) card. The topmost row is now selected (`mmui::XTableCell` sorted by `BoundingRectangle.top`).
+  - **“Add to contacts” also serves as the friend test.** A non-friend's card only has that button; an existing friend's card has “Message / Voice / Video” instead, so nobody already in your contacts receives a request.
+  - The friend-request dialog is located **generically** (the new top-level window after the click, then its submit button), so a renamed window class does not break the flow. Live-verified on 4.1.15.53 (2026-10-23, with the user's authorization): the dialog is `mmui::VerifyFriendWindow` (“申请添加朋友”) and its submit button is **“确定”**, not “发送” — both labels are accepted. The outgoing request was confirmed independently as a new `general.db:FMessageTable` row (`is_sender_=1`, `scene_=14`, recipient = the member's wxid). `dry_run=True` / `--dry-run` still stops at the profile card and clicks nothing.
+- **Fix: `open_chat` could type into the wrong “Search” box.** 4.1.15 exposes up to three `Name='搜索'` edits (session search, in-chat search, group-member search) and the picker took the first in the tree, so with a chat or the info panel open the query landed in the in-chat search and the session never opened. The session box is now preferred by ancestor class, and transient `COMError`s while walking the tree no longer abort `open_chat`. When the client sits on the Moments page (seen after a restart), the normal nav-bar click can be swallowed by the transparent render layer; an extra click on the “微信” tab is used as a last resort — still a rhythm-randomized point with a curved cursor path.
+- **Fix: image bubbles became invisible to `MediaDownloader` on WeChat 4.1.15.56+.** The client renders image bubbles with `mmui::ChatImageItemView` instead of the old `mmui::ChatBubbleReferItemView`, so row-alignment and original-image downloads reported “no image bubble in view”. Both class names are accepted, keeping older clients working; regression covered in `tools/selftest.py`.
+- Verified: 30 new offline checks (topmost-row selection, already-friend, dry-run, missing dialog/message box/submit button), all existing suites green; live: one complete request sent to a non-friend group member (run on a real client with the account owner's authorization) and confirmed in `FMessageTable`, with the earlier probes reaching real profile cards and switching groups.
 
 ### v1.2.7.0 (2026-10-17)
 

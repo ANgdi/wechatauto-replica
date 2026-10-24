@@ -621,7 +621,8 @@ class MediaDownloader:
 
     # 可视行类名 → 参与对齐的种类。实机对着数据库核过一遍（同一会话同一屏）：
     #   ``mmui::ChatTextItemView``          = 文本（Name 是被截断的正文）
-    #   ``mmui::ChatBubbleReferItemView``   = 图片气泡，但**只有 Name=='图片' 的那几行**
+    #   ``mmui::ChatImageItemView``         = 图片气泡（4.1.15.56 实机：Name=='图片'）
+    #   ``mmui::ChatBubbleReferItemView``   = 旧版图片气泡，但**只有 Name=='图片' 的那几行**
     #       （同一个类名还用来渲染引用卡片等，Name 是摘要文字）
     #   ``mmui::ChatBubbleItemView``        = 文件/链接/卡片（库里正文 ~1900 字 XML，
     #       UIA 只给 43 字摘要）——**不是文本行**，按直觉映射成 text 会把整段对齐带偏
@@ -629,7 +630,10 @@ class MediaDownloader:
     #   ``mmui::ChatItemView``              = 时间分隔行（Name 形如 ``11:31``）
     # 后三类不参与对齐：微信的时间文案规则（今天/昨天/M月D日/星期）不值得复刻，
     # 而两侧同时丢掉同一种行不影响对齐结果。
+    # 4.1.15.56 起图片气泡改用独立类名；只认旧类名的后果是图片行整片“看不见”，
+    # 对齐/取原件一路报「可视区里没有图片气泡」。两个类名都留着，跨版本都能用。
     _UI_ROW_KIND = {"mmui::ChatBubbleReferItemView": "image",
+                    "mmui::ChatImageItemView": "image",
                     "mmui::ChatTextItemView": "text"}
     _DB_ROW_KIND = {"图片": "image", "文本": "text"}
 

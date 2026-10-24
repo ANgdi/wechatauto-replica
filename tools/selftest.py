@@ -2280,28 +2280,35 @@ def t_image() -> None:
         def GetChildren(self):
             return self._k
 
-    IMG, TXT, TIME = ("mmui::ChatBubbleReferItemView", "mmui::ChatTextItemView",
-                      "mmui::ChatItemView")
+    IMG, IMG_NEW, TXT, TIME = ("mmui::ChatBubbleReferItemView",
+                               "mmui::ChatImageItemView", "mmui::ChatTextItemView",
+                               "mmui::ChatItemView")
     band = R(466, 0, 3064, 246)                       # 实测：整行宽 2598
     kids = [Row(TXT, "本周试卷", R(466, 0, 3064, 148)),
             Row(TIME, "9月17日 19:50", R(466, 148, 3064, 230)),
             Row(IMG, "图片", R(466, 230, 3064, 476)),
+            Row(IMG_NEW, "图片", R(466, 476, 3064, 700)),   # 4.1.15.56 起的独立类名
             Row(IMG, "交易截图", band),                # 同类的引用卡片，不是图片气泡
-            Row(TXT, "收到", R(466, 476, 3064, 624)),
-            Row(IMG, "图片", R(466, 9000, 3064, 9246))]   # 矩形在列表外＝没渲染
+            Row(IMG_NEW, "交易截图", band),            # 新类名的引用卡片同理
+            Row(TXT, "收到", R(466, 700, 3064, 900)),
+            Row(IMG_NEW, "图片", R(466, 9000, 3064, 9246))]   # 矩形在列表外＝没渲染
     lv = MediaDownloader.__new__(MediaDownloader)
     ui = lv._visible_rows(Lst(kids, R(466, 0, 3064, 1210)))
     check("只收图片行与文本行，时间行/引用卡片/未渲染行都不要",
           [(k, n) for k, n, _c in ui] == [("text", "本周试卷"), ("image", "图片"),
-                                          ("text", "收到")],
+                                          ("image", "图片"), ("text", "收到")],
           str([(k, n) for k, n, _c in ui]))
+    check("4.1.15.56 的 ChatImageItemView 必须按图片行算"
+          "（漏映射会让取原件整条路报「没有图片气泡」）",
+          MediaDownloader._UI_ROW_KIND.get(IMG_NEW) == "image")
     check("认出来的那一行把控件原样带回来（后面要拿它算矩形）",
           all(c.Name is not None for _k, _n, c in ui))
     # 实机对着数据库核过的类名映射（同一会话同一屏）：把 ChatBubbleItemView 当成
     # 文本行是**错**的——它是文件/链接/卡片，正文 1900 字 XML、UIA 只给 43 字摘要。
-    check("类名映射只有图片/文本两项（文件卡片、系统消息、时间行都不在内）",
+    check("类名映射只有图片/文本两类（新旧图片类名都算，文件卡片、系统消息、时间行都不在内）",
           MediaDownloader._UI_ROW_KIND == {
               "mmui::ChatBubbleReferItemView": "image",
+              "mmui::ChatImageItemView": "image",
               "mmui::ChatTextItemView": "text"}, str(MediaDownloader._UI_ROW_KIND))
     check("数据库侧同理：只有「图片」「文本」参与",
           MediaDownloader._DB_ROW_KIND == {"图片": "image", "文本": "text"})

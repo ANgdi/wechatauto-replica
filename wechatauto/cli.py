@@ -430,6 +430,42 @@ def cmd_remark(args):
     return 0 if r["status"] == "成功" else 1
 
 
+def cmd_groupfriend(args):
+    """群成员加好友：打开群 → 聊天信息 → 搜索成员 → 添加到通讯录 → 发送。
+
+    ``--dry-run`` / ``--probe`` 只走到资料卡看按钮，不点「添加到通讯录」。
+    """
+    members = [x.strip() for x in (args.members or "").split(",") if x.strip()]
+    if not members and (args.member or "").strip():
+        members = [args.member.strip()]
+    if not (args.group or "").strip() or not members:
+        print("要加谁？`加好友 群名 成员名` 或 `加好友 群名 --members 小明,小红`")
+        return 2
+    from wechatauto.wx import WeChat          # 只有真要驱动界面时才 import
+    r = WeChat().AddFriendFromGroup(
+        args.group.strip(), members=members, message=args.message,
+        dry_run=bool(args.dry_run or args.probe))
+    print("[%s] %s" % (r["status"], r.get("message")))
+    data = r.get("data") or {}
+    for x in data.get("results") or []:
+        name = x.get("member") or x.get("selected") or "?"
+        reason = x.get("reason") or ""
+        extra = ""
+        if reason == "already-friend":
+            extra = "（已是好友，未点添加）"
+        elif x.get("sent"):
+            extra = "（已点发送）"
+        elif x.get("add"):
+            extra = "（可添加，dry-run 未点）"
+        rows = x.get("results") or []
+        print("  %-20s %s%s" % (name, reason, extra))
+        if rows:
+            print("      搜索结果（按屏幕顺序）：%s" % " / ".join(rows[:5]))
+        if x.get("selected"):
+            print("      选中第 1 行：%s" % x["selected"])
+    return 0 if r["status"] == "成功" else 1
+
+
 def cmd_labels(args):
     """通讯录标签：列表走库（不碰窗口），建/加/移走界面。"""
     action = args.action
@@ -649,6 +685,16 @@ def build_parser():
                    help="只走一遍路径并打开编辑窗，随即关掉（不写任何东西）")
     s.add_argument("--clear", action="store_true", help="清空这个联系人的备注")
     s.add_argument("--no-verify", action="store_true", help="改完不回读数据库确认")
+
+    s = add("addfriend", cmd_groupfriend,
+            "群成员加好友：打开群 → 聊天信息 → 搜索成员 → 添加到通讯录 → 发送")
+    s.add_argument("group", help="群名（界面显示名）")
+    s.add_argument("member", nargs="?", help="成员名（群昵称/备注/昵称）")
+    s.add_argument("--members", help="逗号分隔的多个成员名")
+    s.add_argument("--message", help="好友申请留言；不给就用微信默认文案")
+    s.add_argument("--dry-run", action="store_true",
+                   help="只走到资料卡看能否添加/是否已是好友，不点「添加到通讯录」")
+    s.add_argument("--probe", action="store_true", help="同 --dry-run")
     return p
 
 
@@ -668,6 +714,7 @@ ALIASES = {
     "标签": "labels", "打标签": "labels", "设标签": "labels",
     "转发": "forward", "转给": "forward",
     "备注": "remark", "改备注": "remark", "设置备注和标签": "remark",
+    "加好友": "addfriend", "加群友": "addfriend", "群加好友": "addfriend",
 }
 
 _MENU = (
@@ -682,6 +729,7 @@ _MENU = (
     ("9", "通讯录标签：看/建标签、给标签批量加移成员（会驱动微信窗口）", "labels"),
     ("10", "右键转发一条消息：发给指定人或整个标签（先预演）", "forward"),
     ("11", "改联系人备注（通讯录 → 资料页 → 设置备注和标签）", "remark"),
+    ("12", "群成员加好友（群 → 聊天信息 → 搜索成员 → 添加到通讯录）", "addfriend"),
     ("0", "退出", None),
 )
 
@@ -803,6 +851,21 @@ def menu():
                         rc = int(a.func(a) or 0)
                     else:
                         print("没确认，这次只到预演为止。")
+            elif cmd == "addfriend":
+                grp = _ask("群名（界面显示名）：").strip()
+                ms = _ask("成员名，逗号分隔（例：小明,小红）：").strip()
+                if not grp or not ms:
+                    continue
+                argv = ["addfriend", grp, "--members", ms, "--dry-run"]
+                a = p.parse_args(argv)
+                rc = int(a.func(a) or 0)
+                if rc == 0:
+                    if _ask("上面只打开资料卡看了按钮，没点添加。确认加好友？(y=加)："
+                            ).strip().lower() in ("y", "yes"):
+                        a = p.parse_args(["addfriend", grp, "--members", ms])
+                        rc = int(a.func(a) or 0)
+                    else:
+                        print("没确认，这次只到勘察为止。")
             else:
                 chat, keep = _pick_chat(db, keep)
                 if not chat:

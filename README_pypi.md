@@ -96,6 +96,16 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 
 ## 版本记录
 
+### v1.2.8.0（2026-10-23）
+
+- **新增：群成员加好友——`wx.AddFriendFromGroup("群名", "小明")` / `wechatauto 加好友 群名 成员名`。** 界面路径：打开群 → 右上角「聊天信息」→「搜索群成员」→ 点结果卡片 →「添加到通讯录」→「发送」。
+  - **搜索结果按屏幕位置取第一行，不按控件树顺序。** 一个名字可能命中多行，而 Qt 回收列表的子节点顺序和肉眼看到的顺序不一致；旧写法会打开最下面那张卡。现在按 `BoundingRectangle.top` 排序后取最上面一行。
+  - **「添加到通讯录」同时是好友判据**：非好友的资料卡只有这一颗按钮；已是好友的卡片是「发消息 / 语音聊天 / 视频聊天」，不会给通讯录里已有的人重复发申请。
+  - 好友申请框**不写死类名**：点完「添加到通讯录」后按「新出现的顶层窗 + 提交按钮」定位。2026-10-23 真机跑通完整流程：申请框是 `mmui::VerifyFriendWindow`（标题「申请添加朋友」），**提交按钮叫「确定」而不是「发送」**，两个都认；发完在 `general.db:FMessageTable` 新增一行 `is_sender_=1`、`scene_=14` 的记录，已独立回读确认。`dry_run=True` / `--dry-run` 仍只走到资料卡，一颗按钮都不点。
+- **修复：`open_chat` 会把词打进错误的「搜索」框。** 4.1.15 树里最多同时有三颗 `Name='搜索'` 的输入框（会话搜索、聊天内搜索、群成员搜索）；现在按祖先类名优先会话搜索框，遍历时撞上失效元素也不再打断 `open_chat`。客户端停在朋友圈页时追加一次直接点击「微信」tab 的兜底（仍走拟人随机落点 + 曲线轨迹）。
+- **修复：微信 4.1.15.56 起图片气泡改用独立类名 `mmui::ChatImageItemView`，旧版 `mmui::ChatBubbleReferItemView` 也继续认**（否则 `MediaDownloader` 会把图片行整片判成「看不见」），`tools/selftest.py` 已加回归。
+- 判定：新增 30 项离线自检，原有测试全绿；真机对 1 名非好友群成员完整发出好友申请并在 `FMessageTable` 回读确认。
+
 ### v1.2.7.0（2026-10-17）
 
 - **新增：改联系人备注——`wx.RenameMember("小明", "高中同学")` / `wechatauto 备注 小明 --to "高中同学"`。** 这是第一个会**写账号数据**的功能，所以有三处是刻意的：
@@ -1030,7 +1040,7 @@ quick_send_file(r'D:\资料\报告.pdf', '文件传输助手')
 
 Automate the **WeChat 4.x Windows desktop client** (not the web version): read messages, listen in real time, download media, export full history, read Moments (朋友圈), and send messages — by driving the local client directly.
 
-> **Current version:** 1.2.6.1 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
+> **Current version:** 1.2.8.0 · Windows 10/11 · Python 3.9+ (verified on 3.12) · WeChat **4.1.12+** (verified on 4.1.15.13)
 >
 > **Why this project exists:** the classic [wxauto](https://github.com/cluic/wxauto) relies on the UI Automation tree, which WeChat 4.x broke with self-drawn rendering (no accessibility nodes). wechatauto-replica is a drop-in-style replacement: messages are read through **local database decryption** (SQLCipher 4), and sending uses a **UIA + OCR hybrid** driver that auto-falls back between engines.
 

@@ -34,7 +34,7 @@ check("理想答案：会话名+尾巴 → 会话名",
       _clean_chat_name("文件传输助手按住鼠标 语音输入文字"), "文件传输助手")
 check("无空格变体", _clean_chat_name("同学群按住鼠标语音输入文字"), "同学群")
 check("只剩尾巴词", _clean_chat_name("张三语音输入文字"), "张三")
-check("没有尾巴 → 原样", _clean_chat_name("26级金高~4班（同学群）"), "26级金高~4班（同学群）")
+check("没有尾巴 → 原样", _clean_chat_name("某同学群"), "某同学群")
 check("普通会话名不误伤", _clean_chat_name("李小明"), "李小明")
 check("空 Name → None", _clean_chat_name(None), None)
 check("空白 Name → None", _clean_chat_name("   "), None)

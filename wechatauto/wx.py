@@ -468,6 +468,75 @@ class Chat:
                 return m.forward_to(target or chat.who, save_dir=save_dir)
         return WxResponse.failure(f'会话「{chat.who}」最近 50 条中没有语音消息')
 
+    # -- 群成员加好友（UIA） ----------------------------------------------
+
+    def _group_friend_ops(self):
+        """构造 GroupAddFriendOps；UIA 不可用返回 None（本功能不降级 OCR）。"""
+        from wechatauto.group_friend import GroupAddFriendOps
+        uia = self._gui._get_uia()
+        if uia is None:
+            uia = self._gui._get_uia(refresh=True)
+        if uia is None:
+            return None
+        return GroupAddFriendOps(uia=uia, db=self._db)
+
+    @uilock
+    def ProbeGroupAddFriend(self, group: str, member: str) -> WxResponse:
+        """只走到资料卡：看这个群成员能否加、是不是已经是好友（不点添加）。"""
+        ops = self._group_friend_ops()
+        if ops is None:
+            return WxResponse.failure('UIA 驱动不可用，无法读取群成员资料卡')
+        r = ops.probe(group, member)
+        if r.get('ok'):
+            return WxResponse.success(
+                '已是好友' if r.get('reason') == 'already-friend' else '可添加',
+                data=r)
+        return WxResponse.failure(r.get('reason', '读取失败'), data=r)
+
+    @uilock
+    def AddFriendFromGroup(
+            self,
+            group: str,
+            member: str = None,
+            members: List[str] = None,
+            message: str = None,
+            dry_run: bool = False,
+        ) -> WxResponse:
+        """把群成员加成好友（打开群 → 聊天信息 → 搜索成员 → 添加到通讯录 → 发送）。
+
+        搜索结果有多行时**取视觉上第一行**（Qt 回收列表的子节点顺序不可信）。
+        已是好友的成员不会点「添加到通讯录」，直接返回 ``reason='already-friend'``。
+
+        Args:
+            group: 群名（显示名）
+            member: 单个成员名（群昵称/备注/昵称，微信搜索框能认的那个）
+            members: 批量成员名；给了它就用它，忽略 ``member``
+            message: 好友申请的留言；None 表示保留微信默认文案
+            dry_run: True 只走到资料卡看按钮，不点「添加到通讯录」
+
+        Returns:
+            WxResponse；data 里每条含 ``results``（搜索结果行）、``selected``、
+            ``reason``、``sent``/``added``。
+        """
+        targets = [x for x in (members or ([member] if member else [])) if x]
+        if not group or not targets:
+            return WxResponse.failure('group 和 member(s) 不能为空')
+        ops = self._group_friend_ops()
+        if ops is None:
+            return WxResponse.failure('UIA 驱动不可用，无法添加群成员')
+        results = [ops.add(group, m, message=message, dry_run=dry_run)
+                   for m in targets]
+        ok = all(r.get('ok') for r in results)
+        added = [r.get('member') for r in results if r.get('added')]
+        data = {'group': group, 'results': results, 'added': added,
+                'dry_run': bool(dry_run)}
+        if not ok:
+            bad = next(r for r in results if not r.get('ok'))
+            return WxResponse.failure(bad.get('reason', '添加失败'), data=data)
+        if dry_run:
+            return WxResponse.success('勘察完成（未点添加到通讯录）', data=data)
+        return WxResponse.success(f'已发送 {len(added)} 条好友申请', data=data)
+
     # -- 信息 -------------------------------------------------------------
 
     def ChatInfo(self) -> Dict[str, str]:
