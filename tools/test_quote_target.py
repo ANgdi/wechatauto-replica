@@ -19,7 +19,7 @@ class QuoteTargetTests(unittest.TestCase):
         self.gui.main_hwnd = 42
         self.gui._get_uia = Mock(return_value=None)
         self.gui.right_pane_left, self.gui.render_w, self.gui.render_h = 300, 1500, 975
-        self.gui._input = SimpleNamespace(send_input_click=Mock())
+        self.gui._input = SimpleNamespace(send_input_click=Mock(), _user32=Mock())
         self.gui.ensure_visible = Mock(return_value=True)
         self.gui.open_chat = Mock(return_value=True)
         self.gui.get_input_box = Mock(return_value=(300, 840, 1500, 920))
@@ -115,6 +115,32 @@ class QuoteTargetTests(unittest.TestCase):
             self.gui.ocr = Mock(side_effect=[[('原文', 400, 500, 100, 20)], menu])
             self.assertEqual(self.gui.quote_msg('回复', target_text='原文')['status'], '失败')
             self.gui.input_text.assert_not_called()
+
+    def test_reply_uses_requested_target_and_preserves_body(self):
+        for target, point in [('原文甲', (450, 510)), ('原文乙', (450, 560))]:
+            with self.subTest(target=target):
+                self.messages('原文甲', '原文乙')
+                self.gui._input.send_input_click.reset_mock()
+                self.gui.input_text.reset_mock()
+                result = self.gui.reply_msg('真正的回复正文', target_text=target)
+                self.assertEqual(result['status'], '成功')
+                self.gui._input.send_input_click.assert_called_once_with(*point, right=True)
+                self.gui.input_text.assert_called_once_with('真正的回复正文')
+                self.gui._last_message_y.assert_not_called()
+
+    def test_reply_missing_or_ambiguous_target_cannot_send(self):
+        for target in ('不存在', '原文'):
+            with self.subTest(target=target):
+                self.messages('原文甲', '原文乙')
+                self.assertEqual(self.gui.reply_msg('回复', target_text=target)['status'], '失败')
+                self.gui._input.send_input_click.assert_not_called()
+                self.gui.input_text.assert_not_called()
+
+    def test_reply_propagates_send_failure(self):
+        self.messages('原文甲')
+        self.gui.click_send.return_value = False
+        self.assertEqual(self.gui.reply_msg('回复', target_text='原文甲', verify=True)['status'], '失败')
+        self.gui._verify_sent.assert_not_called()
 
 
 if __name__ == '__main__':
