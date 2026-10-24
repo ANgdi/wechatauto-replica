@@ -51,6 +51,7 @@ import tempfile
 import threading
 import time
 from ctypes import wintypes
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from PIL import Image
@@ -892,7 +893,8 @@ class WeChatGUI:
         render = self._find_render_window(top_hwnd)
         if not render:
             render = top_hwnd  # 渲染窗口缺失时回退用窗口矩形
-        if top_hwnd != self.main_hwnd:
+        pid = self._get_pid(top_hwnd)
+        if top_hwnd != self.main_hwnd or pid != getattr(self, 'pid', None):
             # 连续发送会跳过 UIA 初始化；换窗时也必须清掉坐标与会话缓存。
             self._uia = None
             self._uia_tried = False
@@ -900,8 +902,10 @@ class WeChatGUI:
             self._last_input_box = None
             self._current_chat = None
             self._pending_text = None
+            self._cached_db = None
+            self._cached_db_key = None
         self.main_hwnd = top_hwnd
-        self.pid = self._get_pid(top_hwnd)
+        self.pid = pid
         self.render_hwnd = render
         self._update_render_rect()
         return True
@@ -2095,10 +2099,41 @@ class WeChatGUI:
                                      else '；UIA 没起来，全程走的 OCR'))
 
     def _get_db(self):
-        """惰性创建并复用 WeChatDB（密钥提取/解密较慢，避免每次校验都重建）。"""
-        if getattr(self, '_cached_db', None) is None:
-            from wechatauto.db import WeChatDB
-            self._cached_db = WeChatDB()
+        """回读库跟随窗口进程持有的账号，不能用目录新旧时间猜归属。"""
+        import psutil
+        from wechatauto.db import WeChatDB, auto_detect_db_dir
+
+        pid = self._get_pid(self.main_hwnd)
+        if not pid or pid != self.pid:
+            self._cached_db = None
+            self._cached_db_key = None
+            raise RuntimeError('微信窗口进程已失效或变化，请重新绑定窗口')
+        db_dir = auto_detect_db_dir()
+        if not db_dir:
+            raise RuntimeError('未找到微信数据库目录，无法确认窗口账号')
+        root = Path(db_dir).resolve()
+        accounts = set()
+        # 每次校验重新确认归属：同一进程退出重登后，不能复用旧账号缓存。
+        for item in psutil.Process(pid).open_files():
+            try:
+                parts = Path(item.path).resolve().relative_to(root).parts
+            except ValueError:
+                continue
+            if (len(parts) >= 3 and parts[1].lower() == 'db_storage'
+                    and (root/parts[0]/'db_storage').is_dir()):
+                accounts.add(parts[0])
+        if len(accounts) != 1:
+            raise RuntimeError('无法唯一确认微信窗口的数据库账号，不使用自动选择的其他账号')
+        account = accounts.pop()
+        key = (self.main_hwnd, pid, str(root), account)
+        if getattr(self, '_cached_db_key', None) != key:
+            self._cached_db = None
+            self._cached_db_key = None
+            db = WeChatDB(db_dir=str(root), account=account)
+            if db.account != account:
+                raise RuntimeError('数据库读取器切换了账号，与微信窗口归属不一致')
+            self._cached_db = db
+            self._cached_db_key = key
         return self._cached_db
 
     def _verify_usernames(self, who: Optional[str]) -> List[str]:
