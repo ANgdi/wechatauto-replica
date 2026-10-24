@@ -211,10 +211,16 @@ class WeChatUIA:
         uia.ensure_window()
         uia.open_chat('文件传输助手')
         uia.send_text('你好')
+
+    多开时可传 hwnd=目标主窗口句柄；查找和恢复只限该窗口及原进程，
+    目标失效时返回失败。省略 hwnd 保留自动发现行为。
     """
 
-    def __init__(self, timeout: float = 15.0, search_timeout: float = 2.0):
+    def __init__(self, timeout: float = 15.0, search_timeout: float = 2.0,
+                 hwnd: Optional[int] = None):
         self.timeout = timeout
+        self.hwnd = hwnd
+        self._bound_pid = self._pid_from_hwnd(hwnd) if hwnd is not None else None
         self._win = None
         # 线程安全：WeChatBot 等宿主可能在后台线程实例化本驱动，COM 未初始化
         # 时 uiautomation 会报「尚未调用 CoInitialize / 无法加载
@@ -309,7 +315,10 @@ class WeChatUIA:
         扫描循环里）。KeyboardInterrupt 属于 BaseException，不在此列，照常中断。
         """
         ok = False
-        for hwnd in self._wechat_hwnds():
+        candidates = self._candidate_hwnds()
+        if not candidates and getattr(self, 'hwnd', None) is not None:
+            return False
+        for hwnd in candidates:
             try:
                 ok = self._hot_activate_accessibility(hwnd) or ok
             except Exception as e:
@@ -409,15 +418,30 @@ class WeChatUIA:
         except Exception:
             return None
 
+    def _candidate_hwnds(self, diag=None):
+        """显式绑定后不再全局择窗；关闭或句柄被另一进程复用时失败。"""
+        hwnd = getattr(self, 'hwnd', None)
+        if hwnd is None:
+            return self._wechat_hwnds(diag) if diag is not None else self._wechat_hwnds()
+        try:
+            if (win32gui.IsWindow(hwnd) and self._bound_pid
+                    and self._pid_from_hwnd(hwnd) == self._bound_pid):
+                return [hwnd]
+        except Exception as exc:
+            wxlog.debug('绑定的微信窗口不可用：%s', exc)
+        return []
+
     def _find_main(self):
-        for h in self._wechat_hwnds():
+        for h in self._candidate_hwnds():
             c = self._anchor(h)
             if c is not None and (c.ClassName or "") in MAIN_CLASSES:
+                if getattr(self, 'hwnd', None) is not None and int(c.NativeWindowHandle) != h:
+                    continue
                 return c
         return None
 
     def _login_window(self):
-        for h in self._wechat_hwnds():
+        for h in self._candidate_hwnds():
             c = self._anchor(h)
             if c is not None and (c.ClassName or "") in LOGIN_CLASSES:
                 return c
@@ -488,13 +512,14 @@ class WeChatUIA:
                 self._activate(w)
                 return w
             if (allow_accessibility_wake and self._login_window() is None
-                    and self._wechat_hwnds() and time.time() - last_wake > 5):
+                    and self._candidate_hwnds() and time.time() - last_wake > 5):
                 # 周期性复写 gate：微信重启/重建窗口后该字节会归零，
                 # 需补写以免子控件「昨天能扫今天扫不到」（内部含校验与候选重试）
                 self._wake_accessibility()
                 last_wake = time.time()
                 continue
-            if self._login_window() is None and time.time() - last_pull > 6:
+            if (getattr(self, 'hwnd', None) is None and self._login_window() is None
+                    and time.time() - last_pull > 6):
                 self.wake()
                 last_pull = time.time()
             time.sleep(0.8)
@@ -512,7 +537,7 @@ class WeChatUIA:
         某个锚点为 None 即表示它在新版里失配——据此定位要适配的控件。
         """
         rep = {"main_class": None, "title": None, "layout": "unknown",
-               "anchors": {}, "wechat_hwnds": self._wechat_hwnds()}
+               "anchors": {}, "wechat_hwnds": self._candidate_hwnds()}
         w = self._find_main()
         if w is None:
             rep["layout"] = "not-materialized-or-not-running"
@@ -563,7 +588,7 @@ class WeChatUIA:
         if not force and self._find_main() is not None:
             return True
         scan = {}
-        if not self._wechat_hwnds(scan):
+        if not self._candidate_hwnds(scan):
             self._warn_gate_blocked(scan)
             return False
         deadline = time.time() + max(1.0, timeout)
@@ -588,15 +613,18 @@ class WeChatUIA:
             self._win = w
             self._activate(w)
             return True
+        self._win = None
         if not wake:
             return False
         try:
             if self._login_window() is not None:
                 self._auto_login()
-            elif self._wechat_hwnds():
+            elif self._candidate_hwnds():
                 # 窗口在但树可能是 Qt 空壳：热写 gate 并校验（候选自动重试）
                 self.ensure_materialized(timeout=min(6.0, max(2.0, timeout / 2)))
             else:
+                if getattr(self, 'hwnd', None) is not None:
+                    return False
                 # 走到这里说明连可用窗口都没扫到：以前是静默改走「读屏标志 + wake」，
                 # 用户只看到「没树」，看不出是没登录还是位数不对。
                 scan = {}
@@ -1203,6 +1231,7 @@ class WeChatUIA:
         Ctrl+V 有可能整个落空（焦点没落到输入框上），这时按键照样打下去，
         发出去的会是空消息或上一轮残留的内容。判不达标就不回车并清空。
         """
+        self._send_attempted = False
         if not self.ensure_window():
             return False
         e = self._chat_input()
@@ -1222,6 +1251,8 @@ class WeChatUIA:
                 pass
             return False
         try:
+            # SendKeys 抛异常也可能已经投递回车，调用方不能据 False 重新发送。
+            self._send_attempted = True
             e.SendKeys("{Enter}", waitTime=0.05)
         except Exception:
             return False

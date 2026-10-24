@@ -547,6 +547,8 @@ def t_rhythm() -> None:
 NOT_A_WRITE = {
     ("guia.py", "WeChatGUI", "calibrate_layout"),        # 找按钮位置，不发东西
     ("guia.py", "WeChatGUI", "_to_pinyin"),              # 输入法里选拼音
+    ("guia.py", "WeChatGUI", "input_text"),              # 回车用于提交拼音候选
+    ("guia.py", "WeChatGUI", "open_chat"),               # 回车用于打开搜索结果
     ("moment.py", "Moment", "_match_comment_line"),      # OCR 文本匹配
     ("moment.py", "MomentCommentDialog", "_locate"),     # 定位控件
     ("moment.py", "MomentCommentDialog", "_init_controls"),
@@ -565,7 +567,7 @@ def _write_sink_functions():
     import ast
     import re
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    prim = re.compile(r"SendKeys\('\{Enter\}'\)|press_enter\b|keybd_event\(0x0|'发送'")
+    prim = re.compile(r"SendKeys\([\"']\{Enter\}[\"']|\.key\(VK_RETURN\b|press_enter\b|keybd_event\(0x0|'发送'")
     out = []
     for fname in ("guia.py", "uia_driver.py", "moment.py", "sender.py", "wx.py",
                   "chat.py", "recall.py"):
@@ -741,6 +743,7 @@ def t_gate() -> None:
     class Stub:
         """假 driver：只测 `_wake_accessibility` 的编排（试了哪些窗、标志何时开）。"""
         _wechat_hwnds = lambda self: [1, 2]
+        _candidate_hwnds = WeChatUIA._candidate_hwnds
 
         def __init__(self, boom, hit=True):
             self.boom, self.hit, self.n, self.flag = boom, hit, 0, []
@@ -1757,7 +1760,7 @@ def t_tree() -> None:
     k = src.index("def ensure_materialized(")
     seg2 = src[k:src.index("\n    def ", k + 1)]
     check("ensure_materialized 的早退分支也带诊断",
-          "_warn_gate_blocked" in seg2 and "self._wechat_hwnds(scan)" in seg2)
+          "_warn_gate_blocked" in seg2 and "self._candidate_hwnds(scan)" in seg2)
 
     print("[tree] 窄窗口里点一次退不出会话：按「聊天页那一片出来没有」决定点几下")
     # 用户实测（主窗 848×1274、开着会话）：点第一下导航栏「微信」只把主窗带回聊天页，

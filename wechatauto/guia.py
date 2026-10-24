@@ -51,6 +51,7 @@ import tempfile
 import threading
 import time
 from ctypes import wintypes
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from PIL import Image
@@ -892,7 +893,19 @@ class WeChatGUI:
         render = self._find_render_window(top_hwnd)
         if not render:
             render = top_hwnd  # 渲染窗口缺失时回退用窗口矩形
+        pid = self._get_pid(top_hwnd)
+        if top_hwnd != self.main_hwnd or pid != getattr(self, 'pid', None):
+            # 连续发送会跳过 UIA 初始化；换窗时也必须清掉坐标与会话缓存。
+            self._uia = None
+            self._uia_tried = False
+            self._uia_check_ts = 0.0
+            self._last_input_box = None
+            self._current_chat = None
+            self._pending_text = None
+            self._cached_db = None
+            self._cached_db_key = None
         self.main_hwnd = top_hwnd
+        self.pid = pid
         self.render_hwnd = render
         self._update_render_rect()
         return True
@@ -1429,6 +1442,17 @@ class WeChatGUI:
                 byte）并重建引擎。
         """
         _UIA_REASSERT_INTERVAL = 30.0   # 秒：退化后的自愈检查节流窗口
+        if self._uia is not None:
+            try:
+                root = self._uia._win
+                bound = (getattr(self._uia, 'hwnd', None) == self.main_hwnd
+                         and (root is None or int(root.NativeWindowHandle) == self.main_hwnd))
+            except Exception:
+                bound = False
+            if not bound:
+                self._uia = None
+                self._uia_tried = False
+                self._uia_check_ts = 0.0
         now = time.time()
         if (not refresh
                 and now - getattr(self, '_uia_check_ts', 0.0) < _UIA_REASSERT_INTERVAL):
@@ -1452,7 +1476,7 @@ class WeChatGUI:
             self._uia_tried = True
             try:
                 from wechatauto.uia_driver import WeChatUIA
-                eng = WeChatUIA()
+                eng = WeChatUIA(hwnd=self.main_hwnd)
                 if eng.ensure_window():
                     self._uia = eng
                     wxlog.info('已启用 UIA 驱动（混合路径：UIA 优先，OCR 兜底）')
@@ -1673,17 +1697,43 @@ class WeChatGUI:
     # ------------------------------------------------------------------
     # 输入框
     # ------------------------------------------------------------------
+    def _uia_input_box(self) -> Optional[Tuple[int, int, int, int]]:
+        """读取当前窗口的聊天编辑框，转换为渲染相对坐标。"""
+        try:
+            from wechatauto.uia_driver import CHAT_INPUT_AIDS, _aid_hit
+            uia = self._get_uia()
+            if uia is None or uia._win is None:
+                return None
+            # 多开时 UIA 可能找到另一主窗，不能借用它的坐标。
+            if int(uia._win.NativeWindowHandle) != self.main_hwnd:
+                return None
+            edit = uia._chat_input()
+            if (edit is None or edit.IsOffscreen
+                    or not _aid_hit(edit.AutomationId or '', CHAT_INPUT_AIDS)):
+                return None
+            rect = edit.BoundingRectangle
+            box = (rect.left - self.origin_x, rect.top - self.origin_y,
+                   rect.right - self.origin_x, rect.bottom - self.origin_y)
+            x0, y0, x1, y1 = box
+            if 0 <= x0 < x1 <= self.render_w and 0 <= y0 < y1 <= self.render_h:
+                return box
+        except Exception as exc:
+            wxlog.debug('读取聊天输入控件位置失败：%s', exc)
+        return None
+
     def get_input_box(self) -> Optional[Tuple[int, int, int, int]]:
         """自适应输入框检测，返回渲染相对矩形 (x0,y0,x1,y1)。
 
-        原理：输入框是右侧面板底部一块**全宽浅色区**，与上方消息区以一条
+        优先读取当前窗口的真实 UIA 聊天编辑框；不可用时再做像素探测。
+        输入框是右侧面板底部一块**全宽浅色区**，与上方消息区以一条
         约 2px 的浅灰边框线 ((224,224,224)) 分隔。先取若干探针行（自下而上
         在输入框下半部找一行，要求该行在 right_pane_left..render_w 范围内
         白度 >=0.8），再从探针行向上/向下扫描中心竖线确定输入框上下边界。
         探测失败返回 None（不再回退到默认布局，避免在错误坐标上误点）。
         """
+        self._update_render_rect()
         for _ in range(6):
-            box = self._probe_input_box()
+            box = self._uia_input_box() or self._probe_input_box()
             if box:
                 return box
             time.sleep(0.5)
@@ -1696,16 +1746,13 @@ class WeChatGUI:
             wxlog.info('输入框探测连续失败，自动重新校准布局…')
             self.calibrate_layout()
             for _ in range(3):
-                box = self._probe_input_box()
+                box = self._uia_input_box() or self._probe_input_box()
                 if box:
                     return box
                 time.sleep(0.5)
                 self._update_render_rect()
         wxlog.debug('未检测到输入框')
-        # 兜底：输入框与底部工具栏高度固定，窗口缩放只改变消息区高度。
-        # 实测本机输入框上边 ≈ render_h-391、下边 ≈ render_h-150。
-        return (self.right_pane_left, self.render_h - int(self.render_h * 0.214),
-                self.render_w, self.render_h - int(self.render_h * 0.082))
+        return None
 
     def _probe_input_box(self) -> Optional[Tuple[int, int, int, int]]:
         """探针法定位输入框，失败返回 None。
@@ -1885,7 +1932,10 @@ class WeChatGUI:
         if not box:
             return False
         x0, y0, x1, y1 = box
-        rel = (x0 + 20, y0 + 10, x1 - 20, y0 + 200)
+        # UIA 返回的是编辑控件本身；不能越过它把工具栏图标算成残留文字。
+        rel = (x0 + 20, y0 + 10, x1 - 20, min(y1, y0 + 200))
+        if rel[0] >= rel[2] or rel[1] >= rel[3]:
+            return False
         img = self._grab_screen(self._rel_to_screen(rel))
         px = img.load()
         dark = sum(1 for y in range(0, img.size[1], 2) for x in range(0, img.size[0], 2)
@@ -1925,56 +1975,26 @@ class WeChatGUI:
         return True
 
     def click_send(self, fast: bool = False) -> bool:
-        """发送消息并确认输入框已清空。
+        """只提交一次发送，再等待输入框清空。
 
-        优先回车键（输入框刚粘贴完必已聚焦，回车最可靠）；回车后输入框
-        仍有内容则回退到 OCR 定位「发送」按钮点击。每次操作后都必须确认
-        输入框文本已清空（即消息真正发出），否则重试。
-
-        关键防护：发送前若输入框本无文字，回车等于空发，必须判定失败
-        让上层重试（否则消息未发出却被误判成功）。
-
-        fast=True 时仅回车 + 短等待（分段连续发送用），失败返回 False
-        由 send_msg 回退到完整流程。
+        False 既可能是发送前检查失败，也可能是回车已投递但未确认清空。
+        _send_attempted 区分两者，后者不得由调用方重新输入或提交。
         """
-        # 内容不符时不占用发送节奏（rhythm.gate 会白等一截），也绝不回车。
-        # 待发文本一次性消费：陈旧值会把下一次本来正常的发送误拦下来。
+        self._send_attempted = False
         pending = getattr(self, '_pending_text', None)
         self._pending_text = None
         if not self._pending_text_ok(pending):
             return False
-        rhythm.gate('send')
         box = getattr(self, '_last_input_box', None)
-        if fast:
-            if not self._input_box_has_text(box):
-                return False
-            self._input.key(VK_RETURN)
-            rhythm.nap(0.5)
-            if not self._input_box_has_text(box):
-                return True
+        if not self._input_box_has_text(box):
+            wxlog.debug('发送前输入框无文字，跳过空发')
             return False
-        for attempt in range(3):
-            if not self._input_box_has_text(box):
-                wxlog.debug('发送前输入框无文字，跳过空发')
-                return False
-            self._input.key(VK_RETURN)
-            rhythm.nap(1.0)
-            if not self._input_box_has_text(box):
-                return True
-            wxlog.debug(f'回车发送未生效（attempt={attempt}），改用「发送」按钮')
-            res = self.ocr(self.send_button_region)
-            clicked = False
-            for text, x, y, w, h in res:
-                if '发送' in text:
-                    px, py = rhythm.point((self.origin_x + x, self.origin_y + y,
-                                           self.origin_x + x + w,
-                                           self.origin_y + y + h))
-                    self.wx_click(px, py)
-                    clicked = True
-                    break
-            if not clicked:
-                return False
-            rhythm.nap(1.0)
+        rhythm.gate('send')
+        self._send_attempted = True
+        self._input.key(VK_RETURN)
+        # 清空可能延迟；只轮询，不因像素误判再次按回车或点发送。
+        for attempt in range(1 if fast else 3):
+            rhythm.nap(0.5 if fast or attempt else 1.0)
             if not self._input_box_has_text(box):
                 return True
         return False
@@ -1991,17 +2011,20 @@ class WeChatGUI:
         Returns:
             WxResponse
 
-        整条流程带总时限（默认 75s）：打开会话 / 输入 / 发送任一步偶发
-        失败时重试；已发送但 DB 未落库时轮询等待确认，不重复发送。
+        打开会话和输入阶段允许在 75s 内重试；提交发送后只等待确认，
+        结果不确定时明确失败，不重新投递同一条消息。
         """
         # 快速路径：连续发送同一会话（如分段回复）时，复用已探测的输入框，
-        # 跳过 ensure_visible / 会话重检 / 重复探测与截图确认，失败自动回退完整流程。
+        # 发送前失败才回退完整流程；投递回车后无法确认时禁止重新发送。
         if (not verify and who
                 and who == getattr(self, '_current_chat', None)
                 and getattr(self, '_last_input_box', None) is not None
-                and self.input_text(text, box=self._last_input_box, fast=True)
-                and self.click_send(fast=True)):
-            return WxResponse.success(f'消息已发送：{text}', data={'content': text})
+                and self.input_text(text, box=self._last_input_box, fast=True)):
+            if self.click_send(fast=True):
+                return WxResponse.success(f'消息已发送：{text}', data={'content': text})
+            if self._send_attempted:
+                return WxResponse.failure('已尝试发送但结果未确认，为避免重复发送不再自动重试',
+                                          data={'content': text})
         # 水位必须在任何 UI 动作之前拍：一旦发出去，DB 顶部就已经包含新行了。
         mark = self._send_watermark(who) if verify else None
         # UIA 路径：热激活后可直接输入+回车发送，无 OCR 抖动，最快。
@@ -2010,7 +2033,7 @@ class WeChatGUI:
             already = (not who) or uia.current_chat() == who
             if already or uia.open_chat(who):
                 sent = uia.send_text(text)
-                if not sent and already:
+                if not sent and not getattr(uia, '_send_attempted', False) and already:
                     # current_chat 读的是常驻控件：主窗切到朋友圈页以后，它照样
                     # 返回同一个会话名，于是 open_chat（内含 back_to_chat_tab）被
                     # 整个跳过，send_text 在没有输入框的页面上直接失败——表现就是
@@ -2018,6 +2041,9 @@ class WeChatGUI:
                     # 一次「微信」栏再发；只在第一次失败时做一次，不循环。
                     if uia.back_to_chat_tab() and uia.send_text(text):
                         sent = True
+                if not sent and getattr(uia, '_send_attempted', False):
+                    return WxResponse.failure('已尝试发送但结果未确认，为避免重复发送不再自动重试',
+                                              data={'content': text})
                 if sent:
                     if not verify:
                         return WxResponse.success(f'消息已发送：{text}', data={'content': text})
@@ -2054,6 +2080,9 @@ class WeChatGUI:
                 wxlog.debug(f'输入文字失败（attempt={attempt}），重试')
                 continue
             if not self.click_send():
+                if self._send_attempted:
+                    return WxResponse.failure('已尝试发送但结果未确认，为避免重复发送不再自动重试',
+                                              data={'content': text})
                 stuck = '发送点击没生效（输入框没清空）'
                 wxlog.debug(f'点击发送未确认清空输入框（attempt={attempt}），重试')
                 continue
@@ -2070,10 +2099,41 @@ class WeChatGUI:
                                      else '；UIA 没起来，全程走的 OCR'))
 
     def _get_db(self):
-        """惰性创建并复用 WeChatDB（密钥提取/解密较慢，避免每次校验都重建）。"""
-        if getattr(self, '_cached_db', None) is None:
-            from wechatauto.db import WeChatDB
-            self._cached_db = WeChatDB()
+        """回读库跟随窗口进程持有的账号，不能用目录新旧时间猜归属。"""
+        import psutil
+        from wechatauto.db import WeChatDB, auto_detect_db_dir
+
+        pid = self._get_pid(self.main_hwnd)
+        if not pid or pid != self.pid:
+            self._cached_db = None
+            self._cached_db_key = None
+            raise RuntimeError('微信窗口进程已失效或变化，请重新绑定窗口')
+        db_dir = auto_detect_db_dir()
+        if not db_dir:
+            raise RuntimeError('未找到微信数据库目录，无法确认窗口账号')
+        root = Path(db_dir).resolve()
+        accounts = set()
+        # 每次校验重新确认归属：同一进程退出重登后，不能复用旧账号缓存。
+        for item in psutil.Process(pid).open_files():
+            try:
+                parts = Path(item.path).resolve().relative_to(root).parts
+            except ValueError:
+                continue
+            if (len(parts) >= 3 and parts[1].lower() == 'db_storage'
+                    and (root/parts[0]/'db_storage').is_dir()):
+                accounts.add(parts[0])
+        if len(accounts) != 1:
+            raise RuntimeError('无法唯一确认微信窗口的数据库账号，不使用自动选择的其他账号')
+        account = accounts.pop()
+        key = (self.main_hwnd, pid, str(root), account)
+        if getattr(self, '_cached_db_key', None) != key:
+            self._cached_db = None
+            self._cached_db_key = None
+            db = WeChatDB(db_dir=str(root), account=account)
+            if db.account != account:
+                raise RuntimeError('数据库读取器切换了账号，与微信窗口归属不一致')
+            self._cached_db = db
+            self._cached_db_key = key
         return self._cached_db
 
     def _verify_usernames(self, who: Optional[str]) -> List[str]:
@@ -2436,57 +2496,12 @@ class WeChatGUI:
 
     def reply_msg(self, text: str, who: Optional[str] = None,
                   target_text: Optional[str] = None, verify: bool = False) -> WxResponse:
-        """回复最近一条消息（悬停消息 → 点击「回复」→ 输入 → 发送）。
+        """回复指定/最近一条消息，复用微信的「引用」发送流程。
 
-        target_text 用于在 OCR 结果中匹配目标消息（可选）。
+        target_text 按可见原文唯一定位；找不到或有多个候选时不发送。
+        省略时沿用最近消息定位，不提供按消息 ID 精确引用。
         """
-        # 回复落库的正文带有被回复消息的包装，逐字相等判不了，用包含匹配；
-        # 水位保证「上一次发过的同一句话」不会被当成这一次的确认。
-        mark = self._send_watermark(who) if verify else None
-        if not self.ensure_visible():
-            return WxResponse.failure('微信窗口不可见（可能锁屏/会话断开）')
-        if who:
-            self.open_chat(who)
-            time.sleep(0.8)
-        y = self._last_message_y()
-        if y is None:
-            return WxResponse.failure('未检测到消息区域')
-        u = self._input._user32
-        u.SetCursorPos(self.origin_x + (self.render_w + self.right_pane_left) // 2,
-                       self.origin_y + y)
-        time.sleep(0.8)
-        # OCR 悬停工具栏（回复/引用等图标）
-        region = (self.right_pane_left, y - 60, self.render_w, y + 40)
-        items = self.ocr(region)
-        click_pt = None
-        for text, x, yy, w, h in items:
-            if '回复' in text or '引用' in text or '转发' in text:
-                click_pt = rhythm.point((x, yy, x + w, yy + h))
-                break
-        if not click_pt:
-            wxlog.debug('未识别到回复工具栏，尝试右键菜单')
-            # 这一击的目标是**消息气泡**，不是控件矩形：气泡不铺满面板宽度，
-            # 抖 x 会点到空白处（右键菜单里就没有「回复」了），所以故意不抖。
-            self.wx_click(self.origin_x + (self.render_w + self.right_pane_left) // 2,
-                                    self.origin_y + y, right=True)
-            time.sleep(0.6)
-            menu = self.ocr((self.right_pane_left, y, self.render_w, self.render_h))
-            for text, x, yy, w, h in menu:
-                if '回复' in text:
-                    click_pt = rhythm.point((x, yy, x + w, yy + h))
-                    break
-        if not click_pt:
-            return WxResponse.failure('未找到回复入口')
-        self.wx_click(self.origin_x + click_pt[0], self.origin_y + click_pt[1])
-        time.sleep(0.6)
-        if not self.input_text(text):
-            return WxResponse.failure('输入回复内容失败')
-        self.click_send()
-        if verify:
-            ok = self._verify_sent(text, who, mode='contains', after=mark)
-            return (WxResponse.success(f'回复已发送并确认：{text}', data={'content': text})
-                    if ok else WxResponse.failure('回复已操作发送，但数据库未确认', data={'content': text}))
-        return WxResponse.success(f'回复已发送：{text}', data={'content': text})
+        return self.quote_msg(text, who=who, target_text=target_text, verify=verify)
 
     def _locate_last_message_pt(self, y: int) -> Optional[Tuple[int, int]]:
         """OCR 实测最近一条消息的文本中心（横坐标实测而不是估算中心）。
@@ -2515,26 +2530,34 @@ class WeChatGUI:
                   target_text: Optional[str] = None, verify: bool = False) -> WxResponse:
         """引用指定/最近一条消息（右键 → 菜单「引用」→ 输入 → 发送）。
 
-        target_text 用于 OCR 定位要引用的消息文案（可选）；省略时引用最近一条。
+        target_text 与 OCR 使用相同的空格处理；匹配多条时失败，避免引用错人。
+        省略 target_text 时引用最近一条。
         """
         # 引用消息落库的正文里还包着被引用那条，只能包含匹配；水位见 _send_watermark。
         mark = self._send_watermark(who) if verify else None
         if not self.ensure_visible():
             return WxResponse.failure('微信窗口不可见（可能锁屏/会话断开）')
         if who:
-            self.open_chat(who)
+            if not self.open_chat(who):
+                return WxResponse.failure(f'无法打开会话：{who}')
             time.sleep(0.8)
         box = self.get_input_box()
-        msg_bottom = box[1] if box else int(self.render_h * 0.8)
+        if box is None:
+            return WxResponse.failure('未检测到聊天输入框，无法确定消息扫描范围')
+        msg_bottom = box[1]
         if target_text:
             items = self.ocr((self.right_pane_left, 100, self.render_w, msg_bottom))
-            pt = None
-            for t, x, yy, w, h in items:
-                if target_text in t:
-                    pt = (x + w // 2, yy + h // 2)
-                    break
-            if not pt:
+            # ScreenOCR 会去掉 ASCII 空格，调用参数必须采用相同规则。
+            target = target_text.replace(' ', '')
+            if not target.strip():
+                return WxResponse.failure('要引用的消息文字不能为空白')
+            matches = [(x + w // 2, yy + h // 2) for t, x, yy, w, h in items
+                       if target in t.replace(' ', '')]
+            if not matches:
                 return WxResponse.failure(f'未找到要引用的消息：{target_text}')
+            if len(matches) != 1:
+                return WxResponse.failure('多条可见文字匹配引用目标，无法唯一定位要引用的消息')
+            pt = matches[0]
         else:
             y = self._last_message_y()
             if y is None:
@@ -2548,19 +2571,28 @@ class WeChatGUI:
         # 右键不响应，SendInput 可直接命中弹出菜单（原图那次的同类修复）。
         self._input.send_input_click(self.origin_x + pt[0], self.origin_y + pt[1], right=True)
         time.sleep(0.7)
-        menu = self.ocr((self.right_pane_left, max(80, pt[1] - 200), self.render_w, self.render_h))
-        click_pt = None
-        for t, x, yy, w, h in menu:
-            if '引用' in t:
-                click_pt = rhythm.point((x, yy, x + w, yy + h))
-                break
-        if not click_pt:
-            return WxResponse.failure('未找到「引用」菜单项')
-        self.wx_click(self.origin_x + click_pt[0], self.origin_y + click_pt[1])
+        # OCR 可能把「引用」和相邻菜单行的坐标合并，优先复用真实菜单控件。
+        uia = self._get_uia()
+        item = None
+        if uia is not None and uia._win is not None:
+            if int(uia._win.NativeWindowHandle) == self.main_hwnd:
+                item = uia._uia_find_menu_item('引用')
+        if item is not None:
+            if not uia._uia_click_menu_item(item):
+                return WxResponse.failure('点击「引用」菜单项失败')
+        else:
+            menu = self.ocr((self.right_pane_left, max(80, pt[1] - 200), self.render_w, self.render_h))
+            # 只接受菜单文字本身，正文中含「引用」不能当作菜单项。
+            matches = [(x, yy, x + w, yy + h) for t, x, yy, w, h in menu if t.strip() == '引用']
+            if len(matches) != 1:
+                return WxResponse.failure('未唯一定位到「引用」菜单项')
+            click_pt = rhythm.point(matches[0])
+            self.wx_click(self.origin_x + click_pt[0], self.origin_y + click_pt[1])
         time.sleep(0.8)
         if not self.input_text(text):
             return WxResponse.failure('输入引用内容失败')
-        self.click_send()
+        if not self.click_send():
+            return WxResponse.failure('引用内容未通过发送前检查或发送失败')
         if verify:
             ok = self._verify_sent(text, who, mode='contains', after=mark)
             return (WxResponse.success(f'引用已发送并确认：{text}', data={'content': text})
