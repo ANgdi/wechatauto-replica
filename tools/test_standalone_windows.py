@@ -114,6 +114,7 @@ class StandaloneTests(unittest.TestCase):
 class StandaloneGuiTests(unittest.TestCase):
     def gui(self, kind):
         gui = object.__new__(WeChatGUI)
+        gui.main_hwnd = 22
         gui._uia = Mock()
         gui._uia.window_kind.return_value = kind
         gui._get_uia = Mock(return_value=gui._uia)
@@ -191,6 +192,23 @@ class StandaloneGuiTests(unittest.TestCase):
                     self.assertFalse(method(str(path)))
         gui.copy_files_to_clipboard.assert_not_called()
         gui._input.key.assert_not_called()
+
+    def test_known_standalone_type_blocks_fallback_when_uia_disappears(self):
+        for kind in ('chat', 'history'):
+            with self.subTest(kind=kind):
+                gui = self.gui(kind)
+                self.assertEqual(gui._window_kind(gui._uia), kind)
+                gui._get_uia.return_value = None
+                self.assertFalse(gui.open_chat('测试会话'))
+                self.assertIsNone(gui.get_input_box())
+                self.assertFalse(gui.send_msg('不得回退', who='测试会话'))
+                self.assertFalse(gui.send_msg('不得回退'))
+
+    def test_known_window_type_cannot_follow_a_different_handle(self):
+        gui = self.gui('history')
+        self.assertEqual(gui._window_kind(gui._uia), 'history')
+        gui.main_hwnd = 11
+        self.assertEqual(gui._window_kind(None), 'unknown')
 
 
 if __name__ == '__main__':

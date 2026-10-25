@@ -485,6 +485,7 @@ class WeChatGUI:
         self._current_chat = None  # 最近打开的会话名，用于连续发送时复用
         self._last_input_box = None  # 最近一次成功发送的输入框位置，连续发送复用
         self._uia = None  # UIA 引擎（惰性创建，仅当可用时启用）
+        self._uia_window_kind = None  # 已确认类型随窗口绑定保留，树退化时仍能拒绝误操作
         self._uia_tried = False
         self._uia_check_ts = 0.0  # 上次 UIA 自愈检查时间（节流用）
         # 布局校准：显式 calibrate=True 强制重校准；否则加载本机已校准配置，
@@ -899,6 +900,7 @@ class WeChatGUI:
             self._uia = None
             self._uia_tried = False
             self._uia_check_ts = 0.0
+            self._uia_window_kind = None
             self._last_input_box = None
             self._current_chat = None
             self._pending_text = None
@@ -1479,6 +1481,7 @@ class WeChatGUI:
                 eng = WeChatUIA(hwnd=self.main_hwnd)
                 if eng.ensure_window():
                     self._uia = eng
+                    self._window_kind(eng)
                     wxlog.info('已启用 UIA 驱动（混合路径：UIA 优先，OCR 兜底）')
                 else:
                     self._uia = None
@@ -1488,6 +1491,16 @@ class WeChatGUI:
                 wxlog.debug('初始化 UIA 引擎失败：%s', e)
         return self._uia
 
+    def _window_kind(self, uia) -> str:
+        """仅复用同一 HWND 已确认的类型，UIA 暂时失效不放开独立窗的 OCR 回退。"""
+        hwnd = getattr(self, 'main_hwnd', None)
+        kind = uia.window_kind() if uia is not None else 'unknown'
+        if kind in ('main', 'chat', 'history'):
+            self._uia_window_kind = (hwnd, kind)
+            return kind
+        known = getattr(self, '_uia_window_kind', None)
+        return known[1] if known and known[0] == hwnd else 'unknown'
+
     def open_chat(self, name: str, exact: bool = False) -> bool:
         """打开指定会话的聊天窗口（优先 UIA，其次 OCR 侧栏/搜索）。
 
@@ -1496,12 +1509,13 @@ class WeChatGUI:
         打开后把 GUI 操作目标切到对应窗口，并验证会话真正打开。
         """
         uia = self._get_uia()
+        kind = self._window_kind(uia)
         if uia is not None:
             if uia.open_chat(name):
                 self._current_chat = name
                 return True
-            if uia.window_kind() in ('chat', 'history'):
-                return False
+        if kind in ('chat', 'history'):
+            return False
         if not self.ensure_visible():
             wxlog.warning('无法将微信窗口置于前台，尝试继续操作')
         # 优先：右侧面板当前已打开目标会话 → 直接成功
@@ -1736,7 +1750,7 @@ class WeChatGUI:
         """
         self._update_render_rect()
         uia = self._get_uia()
-        if uia is not None and uia.window_kind() in ('chat', 'history'):
+        if self._window_kind(uia) in ('chat', 'history'):
             # 独立记录窗没有发送框；独立聊天窗也不能借用主窗比例猜坐标。
             return self._uia_input_box()
         for _ in range(6):
@@ -2022,11 +2036,14 @@ class WeChatGUI:
         结果不确定时明确失败，不重新投递同一条消息。
         """
         uia = self._get_uia()
-        kind = uia.window_kind() if uia is not None else 'unknown'
+        kind = self._window_kind(uia)
         if kind == 'history':
             return WxResponse.failure('聊天记录窗口不支持发送消息，请绑定聊天窗口')
-        if kind == 'chat' and who and not uia.open_chat(who):
-            return WxResponse.failure('目标与绑定的独立聊天窗口不一致')
+        if kind == 'chat':
+            if uia is None:
+                return WxResponse.failure('独立聊天窗口 UIA 暂不可用，未尝试坐标回退')
+            if who and not uia.open_chat(who):
+                return WxResponse.failure('目标与绑定的独立聊天窗口不一致')
         # 快速路径：连续发送同一会话（如分段回复）时，复用已探测的输入框，
         # 发送前失败才回退完整流程；投递回车后无法确认时禁止重新发送。
         if (kind != 'chat' and not verify and who
