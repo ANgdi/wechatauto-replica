@@ -1496,9 +1496,12 @@ class WeChatGUI:
         打开后把 GUI 操作目标切到对应窗口，并验证会话真正打开。
         """
         uia = self._get_uia()
-        if uia is not None and uia.open_chat(name):
-            self._current_chat = name
-            return True
+        if uia is not None:
+            if uia.open_chat(name):
+                self._current_chat = name
+                return True
+            if uia.window_kind() in ('chat', 'history'):
+                return False
         if not self.ensure_visible():
             wxlog.warning('无法将微信窗口置于前台，尝试继续操作')
         # 优先：右侧面板当前已打开目标会话 → 直接成功
@@ -1732,6 +1735,10 @@ class WeChatGUI:
         探测失败返回 None（不再回退到默认布局，避免在错误坐标上误点）。
         """
         self._update_render_rect()
+        uia = self._get_uia()
+        if uia is not None and uia.window_kind() in ('chat', 'history'):
+            # 独立记录窗没有发送框；独立聊天窗也不能借用主窗比例猜坐标。
+            return self._uia_input_box()
         for _ in range(6):
             box = self._uia_input_box() or self._probe_input_box()
             if box:
@@ -2014,9 +2021,15 @@ class WeChatGUI:
         打开会话和输入阶段允许在 75s 内重试；提交发送后只等待确认，
         结果不确定时明确失败，不重新投递同一条消息。
         """
+        uia = self._get_uia()
+        kind = uia.window_kind() if uia is not None else 'unknown'
+        if kind == 'history':
+            return WxResponse.failure('聊天记录窗口不支持发送消息，请绑定聊天窗口')
+        if kind == 'chat' and who and not uia.open_chat(who):
+            return WxResponse.failure('目标与绑定的独立聊天窗口不一致')
         # 快速路径：连续发送同一会话（如分段回复）时，复用已探测的输入框，
         # 发送前失败才回退完整流程；投递回车后无法确认时禁止重新发送。
-        if (not verify and who
+        if (kind != 'chat' and not verify and who
                 and who == getattr(self, '_current_chat', None)
                 and getattr(self, '_last_input_box', None) is not None
                 and self.input_text(text, box=self._last_input_box, fast=True)):
@@ -2025,15 +2038,15 @@ class WeChatGUI:
             if self._send_attempted:
                 return WxResponse.failure('已尝试发送但结果未确认，为避免重复发送不再自动重试',
                                           data={'content': text})
-        # 水位必须在任何 UI 动作之前拍：一旦发出去，DB 顶部就已经包含新行了。
+        # 水位必须在提交发送之前拍：一旦发出去，DB 顶部就已经包含新行了。
         mark = self._send_watermark(who) if verify else None
         # UIA 路径：热激活后可直接输入+回车发送，无 OCR 抖动，最快。
-        uia = self._get_uia()
         if uia is not None:
             already = (not who) or uia.current_chat() == who
             if already or uia.open_chat(who):
                 sent = uia.send_text(text)
-                if not sent and not getattr(uia, '_send_attempted', False) and already:
+                if (kind != 'chat' and not sent
+                        and not getattr(uia, '_send_attempted', False) and already):
                     # current_chat 读的是常驻控件：主窗切到朋友圈页以后，它照样
                     # 返回同一个会话名，于是 open_chat（内含 back_to_chat_tab）被
                     # 整个跳过，send_text 在没有输入框的页面上直接失败——表现就是
@@ -2052,6 +2065,9 @@ class WeChatGUI:
                     return WxResponse.failure(
                         '消息已操作发送，但数据库未确认（等了 %gs）'
                         % WxParam.DB_VERIFY_TIMEOUT, data={'content': text})
+        if kind == 'chat':
+            return WxResponse.failure('独立聊天窗口 UIA 发送失败，未尝试坐标回退',
+                                      data={'content': text})
         if not self.ensure_visible():
             return WxResponse.failure('微信窗口不可见（可能锁屏/会话断开）')
         self._last_input_box = None

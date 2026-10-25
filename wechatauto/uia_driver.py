@@ -100,6 +100,8 @@ _STICKER_CODE = re.compile(r"\[[^\[\]]{1,10}\]")
 # 新增候选元组 + 容错匹配（精确 / 点分段相等 / 结尾匹配）+ 结构兜底。
 # ---------------------------------------------------------------------------
 MAIN_CLASSES = ("mmui::MainWindow",)
+CHAT_WINDOW_CLASSES = ("mmui::ChatSingleWindow",)
+HISTORY_WINDOW_CLASSES = ("mmui::SearchMsgUniqueChatWindow",)
 LOGIN_CLASSES = ("mmui::LoginWindow",)
 MAIN_NAME_HINTS = ("微信", "Weixin")               # 标题按“包含”匹配（新版可能带未读数）
 SEARCH_EDIT_CLASSES = ("mmui::XValidatorTextEdit",)
@@ -432,13 +434,27 @@ class WeChatUIA:
         return []
 
     def _find_main(self):
+        # 自动发现仍只选主窗；独立窗必须由调用方显式指定 HWND。
+        classes = MAIN_CLASSES
+        if getattr(self, 'hwnd', None) is not None:
+            classes += CHAT_WINDOW_CLASSES + HISTORY_WINDOW_CLASSES
         for h in self._candidate_hwnds():
             c = self._anchor(h)
-            if c is not None and (c.ClassName or "") in MAIN_CLASSES:
+            if c is not None and (c.ClassName or "") in classes:
                 if getattr(self, 'hwnd', None) is not None and int(c.NativeWindowHandle) != h:
                     continue
                 return c
         return None
+
+    def window_kind(self) -> str:
+        """返回绑定窗口类型：main / chat / history / unknown；不切换窗口。"""
+        win = self._find_main()
+        if win is not None:
+            for kind, classes in (('main', MAIN_CLASSES), ('chat', CHAT_WINDOW_CLASSES),
+                                  ('history', HISTORY_WINDOW_CLASSES)):
+                if win.ClassName in classes:
+                    return kind
+        return 'unknown'
 
     def _login_window(self):
         for h in self._candidate_hwnds():
@@ -532,9 +548,9 @@ class WeChatUIA:
     def describe_layout(self) -> dict:
         """诊断自检：报告当前微信布局与关键锚点解析情况（新旧版兼容排查）。
 
-        返回 dict：main_class / title / layout(merged|legacy|chat) /
+        返回 dict：main_class / title / layout(merged|legacy|chat|standalone-chat|history) /
         anchors{main_window,search_box,session_list,chat_input,main_tabbar,sns_list}。
-        某个锚点为 None 即表示它在新版里失配——据此定位要适配的控件。
+        锚点为 None 表示当前窗口没有该控件，需结合布局判断是否失配。
         """
         rep = {"main_class": None, "title": None, "layout": "unknown",
                "anchors": {}, "wechat_hwnds": self._candidate_hwnds()}
@@ -552,7 +568,9 @@ class WeChatUIA:
                           max_depth=30)
         legacy = _find_by(w, lambda c: (c.ClassName or "") == "mmui::SNSWindow",
                           max_depth=10)
-        rep["layout"] = ("merged" if merged is not None
+        rep["layout"] = ("standalone-chat" if w.ClassName in CHAT_WINDOW_CLASSES
+                         else "history" if w.ClassName in HISTORY_WINDOW_CLASSES
+                         else "merged" if merged is not None
                          else "legacy" if legacy is not None else "chat")
 
         def _desc(el):
@@ -601,7 +619,7 @@ class WeChatUIA:
             time.sleep(0.5)
 
     def ensure_window(self, wake: bool = True, timeout: Optional[float] = None) -> bool:
-        """确保可访问的主窗口存在并置前，返回是否成功。
+        """确保可访问的绑定窗口存在并置前，返回是否成功。
 
         优先 ControlFromHandle 按句柄锚定拿 mmui 树；若树未物化（只剩 Qt
         外壳）则对当前 Weixin 进程热激活，不重启微信。任一环节失败返回
@@ -926,7 +944,7 @@ class WeChatUIA:
 
     def _chat_input(self, win=None):
         win = win or self._win
-        if win is None:
+        if win is None or win.ClassName in HISTORY_WINDOW_CLASSES:
             return None
         # 1) 旧版：aid 短名精确匹配
         e = win.EditControl(AutomationId=CHAT_INPUT_AID)
@@ -937,11 +955,17 @@ class WeChatUIA:
                                                CHAT_INPUT_AIDS))
         if hit is not None:
             return hit
+        # 独立窗只认发送控件的明确锚点，不把其他编辑框当作聊天输入框。
+        if win.ClassName in CHAT_WINDOW_CLASSES:
+            return None
         # 3) 结构兜底：聊天区里可编辑的 Edit（排除搜索框）
         return _find_by(win, lambda c: (c.ControlTypeName == "EditControl"
                                         and SEARCH_EDIT_NAME not in (c.Name or "")))
 
     def current_chat(self) -> Optional[str]:
+        if self._win is not None and self._win.ClassName in CHAT_WINDOW_CLASSES:
+            # 独立窗的输入控件 Name 只是「输入」，会话名称来自根窗口。
+            return self._win.Name or None
         e = self._chat_input()
         return (_clean_chat_name(e.Name) if e else None)
 
@@ -1097,6 +1121,8 @@ class WeChatUIA:
         """
         if self._win is None and not self.ensure_window():
             return False
+        if self._win.ClassName in CHAT_WINDOW_CLASSES + HISTORY_WINDOW_CLASSES:
+            return (not require_list and self._chat_input() is not None)
         bar = _find_by(self._win, lambda c: (c.ClassName or "") == MAIN_TAB_BAR_CLS,
                        max_depth=20)
         if bar is None:
@@ -1160,13 +1186,24 @@ class WeChatUIA:
 
     def open_chat(self, keyword: str, index: Optional[int] = None,
                   section: Optional[str] = None, retries: int = 2) -> bool:
-        """搜索并打开联系人/群聊，成功后校验输入框 Name。返回是否成功。
+        """搜索并打开联系人/群聊；独立窗只接受当前会话。返回是否成功。
 
         传入 username/wxid 时自动映射为昵称/备注/微信号再搜索（微信搜索框
         不认 wxid）。搜索框残留会影响命中，每次打开前先清空重试。
         """
         if not self.ensure_window():
             return False
+        win = self._win
+        if win.ClassName in HISTORY_WINDOW_CLASSES:
+            return False
+        if win.ClassName in CHAT_WINDOW_CLASSES:
+            # 独立窗固定属于一个会话。原生 ID 来自该根节点，不跨账号查库映射。
+            aid = win.AutomationId or ''
+            username = aid[len('ChatSingleWindow'):] if aid.startswith('ChatSingleWindow') else ''
+            matched = bool(keyword and keyword in (self.current_chat(), username))
+            if not matched:
+                wxlog.warning('独立聊天窗口不支持切换到其他会话')
+            return matched
         # 搜索框只在聊天页渲染：主窗停在朋友圈页、或窄窗口里还开着会话时，搜索框
         # 根本不在树里。这里先把界面带回聊天页（必要时点两次退出会话）。
         if not self.back_to_chat_tab():
@@ -1657,6 +1694,12 @@ class WeChatUIA:
         win = win or self._win
         if win is None:
             return None
+        # 记录窗和聊天窗使用不同 aid；优先明确锚点，避免拿到其他虚拟列表。
+        hit = _find_by(win, lambda c: c.ClassName == 'mmui::RecyclerListView'
+                       and _aid_hit(getattr(c, 'AutomationId', ''),
+                                    ('chat_message_list', 'chat_log_message_list')))
+        if hit is not None:
+            return hit
 
         def walk(c, d=0):
             if d > 15:

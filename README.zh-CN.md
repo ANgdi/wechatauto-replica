@@ -61,6 +61,17 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 
 ---
 
+## 显式绑定独立窗口
+
+`WeChatGUI(hwnd=chat_hwnd)`、`WeChatUIA(hwnd=chat_hwnd)` 支持已物化 UIA 树的
+`mmui::ChatSingleWindow`。独立聊天窗通过根窗口标题识别当前会话；`open_chat()`
+接受精确标题，或根节点 AutomationId 中的原生 username。其他目标明确失败，不搜索其他
+窗口，也不转到 OCR。文本通过 UIA 发送，附件输入坐标取自同窗口的 `chat_input_field`。
+
+`mmui::SearchMsgUniqueChatWindow` 是**只读聊天记录窗口**，支持绑定、布局诊断及消息
+列表定位；发送文本、输入附件均失败，不把「搜索」框当作发送框。无 HWND 的 UIA 自动发现
+仍只选择主窗口；显式绑定继续检查 HWND/PID，目标关闭后不会改选另一账号窗口。
+
 ## 🤝 致谢
 
 > 感谢 [vesio](https://github.com/vesio) 在 [issue #1](https://github.com/fanyuantaier/wechatauto-replica/issues/1) 提供微信 4.1.12 的 UIA 控件树代码与思路，促成了 v1.0.8 的 UIA 混合驱动。

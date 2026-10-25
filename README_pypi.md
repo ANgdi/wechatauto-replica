@@ -2,6 +2,23 @@
 
 > **中文版** 在下方 · **English version below**
 
+## 独立窗口 UIA / Standalone-window UIA
+
+显式指定 `WeChatGUI(hwnd=chat_hwnd)` 或 `WeChatUIA(hwnd=chat_hwnd)` 可绑定已物化的
+`mmui::ChatSingleWindow`。会话名取根窗口标题，`open_chat()` 接受精确标题或根节点
+AutomationId 中的原生 username；不同目标失败，不跨窗口搜索或回退 OCR。文本走 UIA，
+附件输入坐标取同窗口的 `chat_input_field`。
+
+`mmui::SearchMsgUniqueChatWindow` 只支持绑定、诊断和消息列表定位，不支持发送；搜索框
+不会被当作聊天输入框。无 HWND 的 UIA 自动发现仍只选主窗，原有 HWND/PID 绑定保护保留。
+
+An explicitly bound, materialized `mmui::ChatSingleWindow` supports UIA text
+sending and input geometry. Its exact title or native AutomationId username must
+match the requested target; a different target fails without OCR or searching
+another window. `mmui::SearchMsgUniqueChatWindow` supports binding, diagnostics
+and message-list lookup only; its search box cannot send messages. Automatic UIA
+discovery still selects main windows, with existing HWND/PID checks preserved.
+
 ---
 
 ## 🇨🇳 中文版
