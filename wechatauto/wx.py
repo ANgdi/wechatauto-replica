@@ -22,6 +22,7 @@ from __future__ import annotations
 import ctypes
 import os
 import re
+import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -1498,7 +1499,7 @@ class WeChat(Chat, Listener):
             self,
             nickname: str,
             callback: Callable[['Message', 'Chat'], None],
-        ) -> WxResponse:
+        ) -> Union['Chat', WxResponse]:
         """添加监听聊天。
 
         Args:
@@ -1506,7 +1507,7 @@ class WeChat(Chat, Listener):
             callback: 回调函数，参数为 (Message 对象, Chat 对象)
 
         Returns:
-            Chat 对象（监听成功后返回）
+            监听成功返回 Chat 对象；失败（已监听 / 找不到联系人）返回 WxResponse
         """
         if not self._listener_is_listening:
             wxlog.debug('检测到未开启监听器，开启监听器')
@@ -1514,8 +1515,11 @@ class WeChat(Chat, Listener):
         if nickname in self.listen:
             return WxResponse.failure('该聊天已监听')
         chat = Chat(nickname, self._gui, self._db)
-        if self._db.get_messages(chat._wxid, limit=1) == [] and not chat._wxid:
-            return WxResponse.failure('找不到聊天窗口')
+        # _resolve_wxid 对未知名字原样返回（恒真值），故用联系人库精确反查兜底：
+        # 昵称/备注都不存在 ⇒ 后续 _run_msg_query 永远查不到表，监听只会静默收不到消息
+        if (nickname not in ('filehelper', '文件传输助手')
+                and self._db.username_by_nickname(nickname) is None):
+            return WxResponse.failure(f'找不到联系人：{nickname}')
         self.listen[nickname] = (chat, callback)
         wrapper = self._make_listen_cb(chat, callback)
         self._listen_wrappers[nickname] = wrapper
@@ -1772,4 +1776,7 @@ class WeChat(Chat, Listener):
         ctypes.windll.user32.GetWindowThreadProcessId(
             self._gui.main_hwnd, ctypes.byref(pid))
         if pid.value:
-            os.system(f'taskkill /f /pid {pid.value}')
+            # subprocess 直调不走 cmd.exe，且能拿到退出码
+            subprocess.run(
+                ['taskkill', '/f', '/pid', str(pid.value)],
+                capture_output=True, check=False)

@@ -423,24 +423,35 @@ class ScreenOCR:
         from winsdk.windows.storage import StorageFile
 
         async def _run() -> List[Tuple[str, int, int, int, int]]:
-            tmp = os.path.join(tempfile.gettempdir(), 'wechatauto_ocr_tmp.png')
-            image.save(tmp)
-            f = await StorageFile.get_file_from_path_async(tmp)
-            s = await f.open_async(0)
-            dec = await BitmapDecoder.create_async(s)
-            bmp = await dec.get_software_bitmap_async()
-            eng = OcrEngine.try_create_from_user_profile_languages()
-            if eng is None:
-                return []
-            res = await eng.recognize_async(bmp)
-            out = []
-            for line in res.lines:
-                text = line.text.replace(' ', '')
-                if not text:
-                    continue
-                r = line.words[0].bounding_rect
-                out.append((text, int(r.x), int(r.y), int(r.width), int(r.height)))
-            return out
+            # 每次唯一临时文件：固定名在并发 OCR（发送校验 × 朋友圈观察）时会互相覆盖
+            fd, tmp = tempfile.mkstemp(suffix='.png', prefix='wechatauto_ocr_')
+            os.close(fd)
+            try:
+                image.save(tmp)
+                f = await StorageFile.get_file_from_path_async(tmp)
+                s = await f.open_async(0)
+                try:
+                    dec = await BitmapDecoder.create_async(s)
+                    bmp = await dec.get_software_bitmap_async()
+                    eng = OcrEngine.try_create_from_user_profile_languages()
+                    if eng is None:
+                        return []
+                    res = await eng.recognize_async(bmp)
+                    out = []
+                    for line in res.lines:
+                        text = line.text.replace(' ', '')
+                        if not text:
+                            continue
+                        r = line.words[0].bounding_rect
+                        out.append((text, int(r.x), int(r.y), int(r.width), int(r.height)))
+                    return out
+                finally:
+                    s.close()
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
         try:
             return asyncio.run(asyncio.wait_for(_run(), timeout=8))

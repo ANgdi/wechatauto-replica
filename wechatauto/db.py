@@ -567,10 +567,13 @@ class WeChatDB:
             if os.path.basename(path) != "contact.db":
                 continue
             conn = self._open(rel)
-            row = conn.execute(
-                "SELECT username, nick_name, remark FROM contact WHERE username=? LIMIT 1",
-                (self.wxid,),
-            ).fetchone()
+            try:
+                row = conn.execute(
+                    "SELECT username, nick_name, remark FROM contact WHERE username=? LIMIT 1",
+                    (self.wxid,),
+                ).fetchone()
+            finally:
+                conn.close()
             if row:
                 return {"username": row[0], "nick_name": row[1], "remark": row[2]}
         return {"username": self.wxid, "nick_name": "", "remark": ""}
@@ -1153,8 +1156,12 @@ class WeChatDB:
                                 for rel, path, _ in self._db_files:
                                     if rel in keys:
                                         continue
-                                    with open(path, "rb") as f:
-                                        page1 = f.read(PAGE_SZ)
+                                    try:
+                                        with open(path, "rb") as f:
+                                            page1 = f.read(PAGE_SZ)
+                                    except OSError:
+                                        # 微信 checkpoint 期间文件可能被短暂替换/锁定，跳过该文件
+                                        continue
                                     if _verify_enc_key(cand, page1, salt=salt_opt):
                                         # 显式 salt 通过 → 存 key+salt（明文头模式）；
                                         # 文件头 salt 通过 → 存裸 key
