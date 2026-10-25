@@ -19,7 +19,7 @@
 本项目复刻上游 wxauto 项目，目标是实现对当前微信 4.x Windows 客户端的自动化
 （读取消息、发送消息、媒体下载、朋友圈），非网页版，直接操作本机客户端。
 
-> 当前版本：1.2.8.0
+> 当前版本：1.2.8.1
 >
 > **兼容范围**：Windows 10/11 ｜ Python 3.9+（已在 3.12 验证）｜ 微信 **4.1.12+**（已在 4.1.15.53 验证）
 > （数据库读取路线对微信版本不敏感；坐标+OCR 发送路线依赖 4.1.12+ 自绘渲染
@@ -89,10 +89,30 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 > 感谢 [WrenZephyrSol](https://github.com/WrenZephyrSol) 在 [issue #20](https://github.com/fanyuantaier/wechatauto-replica/issues/20) 里的复查：同一个会话他拿 `list_message_chats()` 数出 2654 条、走 `get_messages()` 只有 763 条，并贴出逐行源码对照，还给出「下载那一步不能走 `get_message_row`、要自己带 server_id 去语音库捞」的绕行方案。那份分析读的是 v1.2.1，但顺着它挖出了 `local_id` 跨分片重复这个真洞（v1.2.6 修复）。
 >
 > 感谢 [tryqylz](https://github.com/tryqylz) 报告 [issue #34](https://github.com/fanyuantaier/wechatauto-replica/issues/34)：在实际使用中发现「消息发送者编号映射错误，导致名称错位」。人工观察 + 逐处源码定位，两条都成立：`_sender_id_index()` 拿资源库的 `SenderName2Id` 解析本应属于分片 `Name2Id` 的编号，`_resolve_sender()` 把编号 2 固定当成本机账号；给出的改法建议（按消息所在分片以 `Name2Id.rowid` 关联、缺失时保留未知状态）被完整采纳（v1.2.6.1 修复）。
+>
+> 感谢 [dhz1145](https://github.com/dhz1145) 在 [issue #38](https://github.com/fanyuantaier/wechatauto-replica/issues/38)–[#43](https://github.com/fanyuantaier/wechatauto-replica/issues/43) 与 [PR #37](https://github.com/fanyuantaier/wechatauto-replica/pull/37)、[PR #44](https://github.com/fanyuantaier/wechatauto-replica/pull/44) 里的这轮修复：六个问题（输入框定位偏移、引用/回复目标失效、改备注误写相似联系人、多开错窗、校验库错账号、重复发送）每个都带三轮真机复现、独立数据库回读和修复前后对照，修复 PR 含 76 项新离线回归并在 4.1.15.55 双账号真机上验收（v1.2.8.1 修复）。
 
 ---
 
 ## 版本记录
+
+### v1.2.8.1（2026-10-25）
+
+- ⚠️ **重要修复（六项，来自 [PR #37](https://github.com/fanyuantaier/wechatauto-replica/pull/37)，报告人 [dhz1145](https://github.com/dhz1145)，issue #38–#43）：发送链路的目标定位与多开安全。** 每项均附三轮真机复现 + 独立数据库回读 + 修复前后对照。
+  - **输入框定位**（#38）：`get_input_box()` 探测失败时回退「窗口高度比例」估出来的矩形，最高可偏离真实输入框 73px，`send_file` 的「点击聚焦」落在聊天记录区，返回「已发送」实际什么都没发。现在优先读当前窗口的真实 UIA 编辑控件矩形，删掉比例兜底，探测失败明确返回失败；草稿检测只看编辑控件内部，不再把工具栏图标/历史消息当「输入框有文字」。
+  - **重复发送**（#38 评论）：提交回车后若输入框清空确认失败，旧代码会重新粘贴并再提交一次——真实后果是**一次调用发出两条相同消息**。现在回车只提交一次，用 `_send_attempted` 区分「发送前拒绝」（可重试）和「已投递未确认」（明确失败，绝不自动重发）。
+  - **引用/回复**（#39、#41）：OCR 读消息会删掉 ASCII 空格，而 `target_text` 带空格匹配 → 引用必然找不到目标；`reply_msg` 的 `target_text` 参数此前在方法体里根本没被使用（且循环变量覆盖正文，发出去的是菜单词「回复」）。现在目标文字与 OCR 同步去空格，0 个或多个可见候选都明确失败（不再「包含匹配挑一个」）；`reply_msg` 复用 `quote_msg` 同一套定位。
+  - **改备注错人**（#40）：目标联系人不在当前屏、屏内恰有名字包含它的相似联系人时，旧代码会**打开相似者并改掉他的备注**，`verify=True` 也是误写之后才报失败。现在写入前先把完整显示名唯一解析到数据库联系人（解析不到不动手），界面行只认精确名，编辑窗旧值不是目标本人就停手——三层闸全在写入之前。
+  - **多开错窗**（#42）：多账号同时登录时，`WeChatGUI(hwnd=B)` 内部 UIA 引擎仍按窗口面积全局挑窗，绑了 B 实际操作 A。现在 `WeChatUIA(hwnd=)` 可显式绑定窗口，查找/热激活/登录探测全部限定在该 HWND + 原进程；目标关闭或被复用时明确失败，不再静默换到另一账号的窗口。
+  - **校验库错账号**（#43）：多开时发送校验的数据库按「目录 mtime 最新」自动选账号，绑 B 窗口读 A 的库，消息已发出却报「数据库未确认」。现在按窗口进程实际打开的 `db_storage` 路径唯一确认账号，确认不了就明确失败，不自动选别的账号。
+- **新增：独立窗口 UIA**（[PR #44](https://github.com/fanyuantaier/wechatauto-replica/pull/44)）：`WeChatGUI(hwnd=…)` / `WeChatUIA(hwnd=…)` 显式绑定支持已物化的 `mmui::ChatSingleWindow`（独立聊天窗，可发文本/附件，输入框坐标取自该窗口真实 `chat_input_field`）；`mmui::SearchMsgUniqueChatWindow`（聊天记录窗）按**只读**处理——可绑定、诊断、读消息列表，发送/输入一律拒绝，搜索框永远不会被当作发送框。目标与窗口不一致时明确失败，不跨窗搜索、不降级 OCR。新增 `window_kind()` 与 `describe_layout()` 的 `standalone-chat` / `history` 布局区分。不传 HWND 的自动发现仍只认主窗，原行为不变。
+- **内部修复（`6a3d63e`）：连接泄漏 / 监听假成功 / 密钥提取中断 / OCR 竞态。**
+  - `db.py` `get_self_info()` 补 `try/finally` 关闭 sqlite 连接——这是监听轮询的高频路径，连接不关会持续泄漏句柄并锁住解密缓存目录。
+  - `db.py` 密钥提取读页 1 时加 `OSError` 保护：微信 checkpoint 期间文件可能被短暂替换/锁定，以前单个文件读失败会中断整轮提取，现在跳过该文件继续。
+  - `wx.py` `AddListenChat()` 的失败判据原来**恒为 False**（`_resolve_wxid` 对未知名字原样返回、恒真值），拼错昵称会静默注册一个永远收不到消息的监听、还报成功。现在监听注册前用联系人库按昵称/备注精确反查，查不到直接返回失败；返回类型注解同步改为 `Union[Chat, WxResponse]`。
+  - `guia.py` `ScreenOCR` 的固定临时文件名改 `mkstemp` 唯一名并用后清理——发送校验与朋友圈观察并发跑 OCR 时会互相覆盖临时图。`wx.py` `ShutDown()` 的 `os.system('taskkill')` 顺手改成 `subprocess.run`（不走 cmd.exe、能拿退出码）。
+  - 新增 `tests/test_pure.py` 24 例纯函数单测（密钥校验 / 内容格式化 / aid 匹配 / md5 提取），不碰微信，`python -m unittest discover -s tests` 即可跑。
+- 判定：合并树上新增 76 项离线回归（输入框 8、引用/回复 13、备注 7、窗口绑定 9、发送重试 7、数据库绑定 12、独立窗口 20）全绿；`tests/test_pure.py` 24/24；全部既有套件零回归；`tools/selftest.py` 560/0。
 
 ### v1.2.8.0（2026-10-23）
 

@@ -108,10 +108,25 @@ wechatauto 朋友圈 --me              # 看自己发的朋友圈
 > 感谢 [WrenZephyrSol](https://github.com/WrenZephyrSol) 在 [issue #20](https://github.com/fanyuantaier/wechatauto-replica/issues/20) 里的复查：同一个会话他拿 `list_message_chats()` 数出 2654 条、走 `get_messages()` 只有 763 条，并贴出逐行源码对照，还给出「下载那一步不能走 `get_message_row`、要自己带 server_id 去语音库捞」的绕行方案。那份分析读的是 v1.2.1，但顺着它挖出了 `local_id` 跨分片重复这个真洞（v1.2.6 修复）。
 >
 > 感谢 [tryqylz](https://github.com/tryqylz) 报告 [issue #34](https://github.com/fanyuantaier/wechatauto-replica/issues/34)：在实际使用中发现「消息发送者编号映射错误，导致名称错位」。人工观察 + 逐处源码定位，两条都成立：`_sender_id_index()` 拿资源库的 `SenderName2Id` 解析本应属于分片 `Name2Id` 的编号，`_resolve_sender()` 把编号 2 固定当成本机账号；给出的改法建议（按消息所在分片以 `Name2Id.rowid` 关联、缺失时保留未知状态）被完整采纳（v1.2.6.1 修复）。
+>
+> 感谢 [dhz1145](https://github.com/dhz1145) 在 [issue #38](https://github.com/fanyuantaier/wechatauto-replica/issues/38)–[#43](https://github.com/fanyuantaier/wechatauto-replica/issues/43) 与 [PR #37](https://github.com/fanyuantaier/wechatauto-replica/pull/37)、[PR #44](https://github.com/fanyuantaier/wechatauto-replica/pull/44) 里的这轮修复：六个问题（输入框定位偏移、引用/回复目标失效、改备注误写相似联系人、多开错窗、校验库错账号、重复发送）每个都带三轮真机复现、独立数据库回读和修复前后对照，修复 PR 含 76 项新离线回归并在 4.1.15.55 双账号真机上验收（v1.2.8.1 修复）。
 
 ---
 
 ## 版本记录
+
+### v1.2.8.1（2026-10-25）
+
+- ⚠️ **重要修复（六项，来自 [PR #37](https://github.com/fanyuantaier/wechatauto-replica/pull/37)，报告人 [dhz1145](https://github.com/dhz1145)，issue #38–#43）：发送链路的目标定位与多开安全。** 每项均附三轮真机复现 + 独立数据库回读 + 修复前后对照。
+  - **输入框定位**（#38）：探测失败时回退「窗口高度比例」估算矩形，最高偏离真实输入框 73px，`send_file` 返回「已发送」实际没发；现在优先读真实 UIA 编辑控件矩形，删比例兜底，失败即报失败。
+  - **重复发送**（#38 评论）：回车后确认失败会重新粘贴再提交——一次调用发出两条相同消息；现在回车只提交一次，「已投递未确认」明确失败、绝不自动重发。
+  - **引用/回复**（#39、#41）：OCR 删 ASCII 空格而 `target_text` 带空格 → 引用必失败；`reply_msg` 的 `target_text` 此前根本没被使用（循环变量还覆盖了正文）。现在与 OCR 同步去空格，0 个或多个候选都明确失败，`reply_msg` 复用 `quote_msg`。
+  - **改备注错人**（#40）：目标不在屏、屏内有相似名时旧代码**改掉相似联系人的备注**，`verify=True` 也是误写后才失败；现在写入前唯一解析联系人 + 精确匹配行 + 编辑窗旧值核对，三层闸全在写入之前。
+  - **多开错窗**（#42）：`WeChatGUI(hwnd=B)` 内部 UIA 仍按面积全局挑窗、操作 A；现在 `WeChatUIA(hwnd=)` 显式绑定，查找/热激活/登录探测限定该 HWND + 原进程，目标失效明确失败。
+  - **校验库错账号**（#43）：校验库按目录 mtime 自动选账号，绑 B 读 A，消息已发出却报「未确认」；现在按窗口进程实际打开的 `db_storage` 路径唯一确认账号，确认不了就失败。
+- **新增：独立窗口 UIA**（[PR #44](https://github.com/fanyuantaier/wechatauto-replica/pull/44)）：显式绑定支持 `mmui::ChatSingleWindow`（独立聊天窗，可发文本/附件）；`mmui::SearchMsgUniqueChatWindow`（聊天记录窗）只读——可绑定/诊断/读消息列表，发送与输入一律拒绝，搜索框不会当作发送框。目标不一致明确失败，不跨窗、不降级 OCR；新增 `window_kind()`。自动发现仍只认主窗。
+- **内部修复（`6a3d63e`）：连接泄漏 / 监听假成功 / 密钥提取中断 / OCR 竞态。** `get_self_info()` 补 `try/finally` 关连接（监听高频路径句柄泄漏锁缓存目录）；密钥提取页 1 读取容忍 `OSError`（checkpoint 期间单文件失败跳过、不再中断整轮）；`AddListenChat()` 的失败判据原来恒为 False，拼错昵称会**静默假成功**，现在注册前按联系人库精确反查；OCR 固定临时文件改 `mkstemp` 唯一名（并发互相覆盖）；`ShutDown` 的 `os.system` 改 `subprocess.run`。新增 `tests/test_pure.py` 24 例纯函数单测（不碰微信）。
+- 判定：合并树新增 76 项离线回归全绿，既有套件零回归，`tools/selftest.py` 560/0。
 
 ### v1.2.8.0（2026-10-23）
 
@@ -1249,6 +1264,19 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 
 ## 📝 Changelog
 
+### v1.2.8.1 (2026-10-25)
+
+- ⚠️ **Important fixes (six, from [PR #37](https://github.com/fanyuantaier/wechatauto-replica/pull/37), reported by [dhz1145](https://github.com/dhz1145), issues #38–#43): targeting and multi-instance safety on the send path.** Every item came with three live reproductions, an independent database read-back, and before/after comparisons.
+  - **Input-box location** (#38): the window-height-ratio fallback could sit up to 73 px above the real input, so `send_file` reported "sent" while the focus click landed in the message area. The real UIA edit-control rectangle is now preferred, the ratio fallback is gone, and a failed probe is reported as failure.
+  - **Duplicate sends** (#38 comment): a failed "input cleared" check used to re-paste and submit again — two identical messages from one call. Enter is now submitted exactly once; "submitted, unconfirmed" is an explicit failure that is never auto-resent.
+  - **Quote / reply targeting** (#39, #41): OCR drops ASCII spaces while `target_text` kept them, so quotes never matched; `reply_msg`'s `target_text` was never read at all. Space handling is now shared with OCR, zero/multiple candidates fail explicitly, and `reply_msg` reuses `quote_msg`'s locator.
+  - **Remark written to the wrong contact** (#40): with the target off-screen and a similar name on-screen, the old code rewrote the similar contact's remark and only failed after the mis-write. Three pre-write gates now apply: unique database resolution, exact on-screen matching, and editor-value confirmation.
+  - **Wrong window with multiple accounts** (#42): `WeChatGUI(hwnd=B)`'s UIA engine still picked windows globally by area. `WeChatUIA(hwnd=…)` now binds explicitly, with lookups/hot-activation/login detection confined to that HWND + original PID.
+  - **Verification database on the wrong account** (#43): send verification picked the account by newest directory mtime; it now follows the `db_storage` paths the window's process actually holds and fails when it cannot confirm uniquely.
+- **New: standalone-window UIA** ([PR #44](https://github.com/fanyuantaier/wechatauto-replica/pull/44)): explicit binding accepts a materialized `mmui::ChatSingleWindow` (text/attachment sending works); `mmui::SearchMsgUniqueChatWindow` is read-only — binding, diagnostics and message-list lookup work, sends/input are refused, its search box never becomes a send input. A mismatched target fails without searching other windows or falling back to OCR; new `window_kind()`. Auto-discovery still selects main windows only.
+- **Internal fixes (`6a3d63e`): connection leak / silent listen "success" / key extraction abort / OCR race.** `get_self_info()` closes its sqlite connection in `try/finally` (a high-frequency path during listening whose leaked handles locked the decryption cache directory); page-1 reads during key extraction tolerate `OSError` (a file replaced/locked by checkpointing is skipped instead of aborting the round); `AddListenChat()`'s failure test was always False, so a mistyped nickname **silently reported success** while never receiving messages — registration now does an exact contact lookup first; the OCR temp file becomes a unique `mkstemp` name (concurrent OCR used to overwrite each other); `ShutDown()`'s `os.system` becomes `subprocess.run`. New `tests/test_pure.py` with 24 pure-function unit tests that never touch WeChat.
+- Verified: 76 new offline regressions green on the merged tree, all existing suites unregressed, `tools/selftest.py` 560/0.
+
 ### v1.2.7.0 (2026-10-17)
 
 - **New: set a contact's remark — `wx.RenameMember("Bob", "high school")` / `wechatauto 备注 Bob --to "high school"`.** This is the first feature that writes to your account data, so three things are deliberate:
@@ -1575,6 +1603,8 @@ Thanks to [dhz1145](https://github.com/dhz1145) for reporting [issue #32](https:
 Thanks to [WrenZephyrSol](https://github.com/WrenZephyrSol) for the follow-up on [issue #20](https://github.com/fanyuantaier/wechatauto-replica/issues/20): on the same chat `list_message_chats()` counted 2654 messages while `get_messages()` returned 763, and they pasted a line-by-line source comparison plus a workaround that avoided `get_message_row` for downloads by carrying `server_id` over themselves. The analysis was written against v1.2.1, but following it uncovered the real hole — `local_id` is not unique across shards (fixed in v1.2.6).
 
 Thanks to [tryqylz](https://github.com/tryqylz) for reporting [issue #34](https://github.com/fanyuantaier/wechatauto-replica/issues/34) after noticing it in real use: sender names came out misaligned. Both findings held up — `_sender_id_index()` resolved `real_sender_id` through `SenderName2Id` in the resource database when the number belongs to the shard's own `Name2Id`, and `_resolve_sender()` treated id 2 as the local account unconditionally. The proposed fix (join on `Name2Id.rowid` inside the shard the row lives in, and keep an unknown state when no mapping exists rather than guessing from another database) is exactly what shipped in v1.2.6.1.
+
+Thanks to [dhz1145](https://github.com/dhz1145) for the fix round spanning [issues #38](https://github.com/fanyuantaier/wechatauto-replica/issues/38)–[#43](https://github.com/fanyuantaier/wechatauto-replica/issues/43), [PR #37](https://github.com/fanyuantaier/wechatauto-replica/pull/37) and [PR #44](https://github.com/fanyuantaier/wechatauto-replica/pull/44): each of the six problems (input-box offset, dead quote/reply targeting, remarks written to a similar-named contact, wrong window under multiple accounts, verification reading the wrong account's database, duplicate sends) arrived with three live reproductions, an independent database read-back and before/after comparisons, and the fix PRs carried 76 new offline regressions verified live on a two-account 4.1.15.55 setup (fixed in v1.2.8.1).
 
 ## 📄 License & Disclaimer
 
