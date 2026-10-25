@@ -2146,8 +2146,15 @@ class WeChatGUI:
             raise RuntimeError('未找到微信数据库目录，无法确认窗口账号')
         root = Path(db_dir).resolve()
         accounts = set()
+        try:
+            opened = psutil.Process(pid).open_files()
+        except (psutil.Error, OSError) as exc:
+            # 枚举失败后归属不再可信；清掉旧库，待下次重新确认账号。
+            self._cached_db = None
+            self._cached_db_key = None
+            raise RuntimeError('无法唯一确认微信窗口的数据库账号，不使用自动选择的其他账号') from exc
         # 每次校验重新确认归属：同一进程退出重登后，不能复用旧账号缓存。
-        for item in psutil.Process(pid).open_files():
+        for item in opened:
             try:
                 parts = Path(item.path).resolve().relative_to(root).parts
             except ValueError:

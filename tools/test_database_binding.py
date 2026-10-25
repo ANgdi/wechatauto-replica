@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import psutil
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from wechatauto.guia import WeChatGUI
 
@@ -66,10 +68,63 @@ class DatabaseBindingTests(unittest.TestCase):
             self.gui._get_db()
         self.database_factory.assert_not_called()
 
-    def test_file_enumeration_failure_is_visible(self):
-        self.process.open_files.side_effect = PermissionError('无法读取进程文件')
-        with self.assertRaises(PermissionError):
+    def test_process_enumeration_errors_are_chained_as_unknown_account(self):
+        errors = [psutil.NoSuchProcess(202), psutil.AccessDenied(202),
+                  psutil.ZombieProcess(202), PermissionError('无法读取进程文件'),
+                  FileNotFoundError('进程已退出'), OSError('进程读取失败')]
+        for stage in ('process', 'files'):
+            for error in errors:
+                with self.subTest(stage=stage, error=type(error).__name__):
+                    self.process_factory.side_effect = error if stage == 'process' else None
+                    self.process.open_files.side_effect = error if stage == 'files' else lambda: self.opened
+                    with self.assertRaisesRegex(RuntimeError, '无法唯一确认微信窗口的数据库账号') as raised:
+                        self.gui._get_db()
+                    self.assertIs(raised.exception.__cause__, error)
+                    self.assertIsNone(self.gui._cached_db)
+                    self.assertIsNone(self.gui._cached_db_key)
+                    self.database_factory.assert_not_called()
+
+    def test_enumeration_failure_discards_cache_and_recovery_rechecks_account(self):
+        for recovered_account in ('account_b', 'account_a'):
+            with self.subTest(account=recovered_account):
+                self.opened = [self.file('account_b')]
+                self.process.open_files.side_effect = lambda: self.opened
+                first = self.gui._get_db()
+                self.process.open_files.side_effect = psutil.AccessDenied(202)
+                with self.assertRaises(RuntimeError):
+                    self.gui._get_db()
+                self.assertIsNone(self.gui._cached_db)
+                self.assertIsNone(self.gui._cached_db_key)
+                self.opened = [self.file(recovered_account)]
+                self.process.open_files.side_effect = lambda: self.opened
+                recovered = self.gui._get_db()
+                self.assertIsNot(recovered, first)
+                self.assertEqual(recovered.account, recovered_account)
+
+    def test_unexpected_enumeration_errors_are_not_hidden(self):
+        error = ValueError('意外的程序错误')
+        self.process.open_files.side_effect = error
+        with self.assertRaises(ValueError) as raised:
             self.gui._get_db()
+        self.assertIs(raised.exception, error)
+        self.database_factory.assert_not_called()
+
+    def test_database_constructor_errors_are_not_labeled_as_enumeration_failure(self):
+        error = OSError('数据库初始化失败')
+        self.database_factory.side_effect = error
+        with self.assertRaises(OSError) as raised:
+            self.gui._get_db()
+        self.assertIs(raised.exception, error)
+        self.assertIsNone(self.gui._cached_db)
+        self.assertIsNone(self.gui._cached_db_key)
+
+    def test_verification_callers_keep_their_failure_results(self):
+        self.process.open_files.side_effect = psutil.AccessDenied(202)
+        self.assertEqual(self.gui._verify_usernames('target'), ['target'])
+        self.assertIsNone(self.gui._send_watermark('target'))
+        self.assertFalse(self.gui._verify_sent('正文', 'target'))
+        self.assertEqual(self.gui._target_seq('target'), 0)
+        self.assertFalse(self.gui._verify_attachment_sent('test.txt', 'target'))
         self.database_factory.assert_not_called()
 
     def test_missing_database_root_does_not_auto_pick(self):
