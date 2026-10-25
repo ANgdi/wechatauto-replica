@@ -182,6 +182,21 @@ Runnable demo: `python -m wechatauto.demo_moments_interact [--like N | --unlike 
 > click / paste / send. Layout varies across versions and it is not
 > production-grade — use it only on a test account to validate the pipeline.
 
+## Explicit standalone windows
+
+`WeChatGUI(hwnd=chat_hwnd)` and `WeChatUIA(hwnd=chat_hwnd)` also accept a
+materialized `mmui::ChatSingleWindow`. Its title identifies the current chat;
+`open_chat()` accepts that exact title or the native username exposed by the
+window's AutomationId. A different target fails without searching another window
+or using OCR. Text sending uses UIA; attachment input geometry comes from the
+same window's `chat_input_field`.
+
+A bound `mmui::SearchMsgUniqueChatWindow` is a **read-only chat-history window**:
+UIA binding, layout diagnostics and message-list lookup work, but text and
+attachment input fail. Its search box is never treated as a send input.
+Automatic UIA discovery still selects only main windows. Explicit bindings keep
+the existing HWND/PID checks; closing the target does not select another account.
+
 ## 🧠 How It Works
 
 - **Reading** — WeChat 4.x stores everything in SQLCipher 4 encrypted SQLite databases under `xwechat_files/<wxid>/db_storage/` (`contact.db`, `message_*.db`, `media_0.db`, `sns.db`, …). Each DB has its own 32-byte key living in the Weixin.exe process memory (`com.Tencent.WCDB.Config.Cipher` config objects). The library locates them with a **read-only memory scan**, validates candidates with SQLCipher HMAC rules, decrypts pages to a temp dir and caches the result (first decrypt ~6s, then instant). WAL incremental merging with frame-salt filtering prevents `database disk image is malformed` corruption.

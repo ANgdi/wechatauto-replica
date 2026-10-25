@@ -121,6 +121,7 @@ class WindowBindingTests(unittest.TestCase):
         gui._uia = object()
         gui._uia_tried = True
         gui._uia_check_ts = 100
+        gui._uia_window_kind = (11, 'history')
         gui._last_input_box = (1, 2, 3, 4)
         gui._current_chat = '同名会话'
         gui._pending_text = '旧草稿'
@@ -134,6 +135,7 @@ class WindowBindingTests(unittest.TestCase):
             self.assertIsNone(getattr(gui, name))
         self.assertFalse(gui._uia_tried)
         self.assertEqual(gui._uia_check_ts, 0)
+        self.assertIsNone(gui._uia_window_kind)
 
 
 if __name__ == '__main__':

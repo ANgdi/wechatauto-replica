@@ -79,6 +79,7 @@ class SendRetryTests(unittest.TestCase):
 
     def test_uia_enter_exception_cannot_trigger_second_send(self):
         engine = object.__new__(WeChatUIA)
+        engine.window_kind = Mock(return_value='main')
         engine.ensure_window = Mock(return_value=True)
         edit = Mock()
         edit.SendKeys.side_effect = RuntimeError('提交后连接断开')

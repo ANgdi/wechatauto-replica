@@ -29,6 +29,7 @@ class InputBoxTests(unittest.TestCase):
             AutomationId='main.chat_input_field', IsOffscreen=False,
             BoundingRectangle=SimpleNamespace(left=434, top=877, right=1625, bottom=956))
         self.uia = SimpleNamespace(_win=SimpleNamespace(NativeWindowHandle=42),
+                                   window_kind=Mock(return_value='main'),
                                    _chat_input=Mock(return_value=self.edit))
         self.gui._get_uia = Mock(return_value=self.uia)
         sleeper = patch('wechatauto.guia.time.sleep')

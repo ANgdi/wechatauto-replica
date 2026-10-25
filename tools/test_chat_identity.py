@@ -43,6 +43,7 @@ check("会话名本身就叫这个也不吃掉（head 为空则原样)",
 
 # current_chat 走一遍真逻辑
 eng = object.__new__(WeChatUIA)
+eng._win = None
 
 
 class _Ctrl:
