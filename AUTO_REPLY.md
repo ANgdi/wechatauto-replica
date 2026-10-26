@@ -105,15 +105,25 @@ python -m wechatauto.demo_auto_reply --all --rules auto_reply_rules.json
 ## 4. 接入 AI（可选，已内置）
 
 代码在 `wechatauto/ai_reply.py`，走 **OpenAI 兼容** 的 `/chat/completions`
-（DeepSeek / OpenAI / Ollama / vLLM 都行）。Key 只从环境变量读，不写代码、不落盘。
+（DeepSeek / OpenAI / Ollama / vLLM 都行）。
+
+Key 放在仓库根目录的 **`.env`** 里（该文件已被 `.gitignore` 忽略，不会推到 GitHub）：
+
+```ini
+WECHATAUTO_AI_KEY=sk-你的key
+WECHATAUTO_AI_BASE=https://api.deepseek.com/v1
+WECHATAUTO_AI_MODEL=deepseek-chat
+```
+
+没有 `.env` 就复制 `.env.example`：
 
 ```powershell
-$env:WECHATAUTO_AI_KEY="sk-..."                          # 必填
-$env:WECHATAUTO_AI_BASE="https://api.deepseek.com/v1"     # 可选，默认就是这个
-$env:WECHATAUTO_AI_MODEL="deepseek-chat"                  # 可选
-# $env:WECHATAUTO_AI_SYSTEM="你是..."                     # 可选，系统提示词
-# $env:WECHATAUTO_AI_TIMEOUT="20"                         # 可选，秒
+Copy-Item .env.example .env
+notepad .env
 ```
+
+优先级：**系统环境变量 > `.env`**（`.env` 只补缺失项，不会覆盖你已有的设置）。
+改完 `.env` 要**重启 GUI** 才生效。
 
 然后：
 
@@ -123,12 +133,12 @@ $env:WECHATAUTO_AI_MODEL="deepseek-chat"                  # 可选
 匹配顺序是 **规则命中 → AI → 兜底回复**。AI 调用在「每个会话自己的监听线程」里同步进行
 （带超时），只影响该会话，不会阻塞数据库轮询；超时/失败会退回兜底回复。
 
-Ollama 例子：
+Ollama 例子（写进 `.env`）：
 
-```powershell
-$env:WECHATAUTO_AI_BASE="http://127.0.0.1:11434/v1"
-$env:WECHATAUTO_AI_MODEL="qwen2.5:7b"
-$env:WECHATAUTO_AI_KEY="ollama"      # 本地服务随便填一个非空值
+```ini
+WECHATAUTO_AI_BASE=http://127.0.0.1:11434/v1
+WECHATAUTO_AI_MODEL=qwen2.5:7b
+WECHATAUTO_AI_KEY=ollama
 ```
 
 ## 5. 群聊怎么触发

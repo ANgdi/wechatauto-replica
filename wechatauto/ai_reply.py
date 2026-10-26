@@ -2,7 +2,8 @@
 """可选的 AI 回复钩子（OpenAI 兼容接口，不用额外依赖）。
 
 只负责「给一段对方消息，返回一段回复文本」，不碰微信、不碰线程。
-默认从环境变量读配置：
+
+配置优先读环境变量，其次读仓库根目录的 ``.env``（``.env`` 已 gitignore）：
 
     WECHATAUTO_AI_KEY     必填，API Key
     WECHATAUTO_AI_BASE    接口地址，默认 https://api.deepseek.com/v1
@@ -11,7 +12,7 @@
     WECHATAUTO_AI_TIMEOUT 超时秒数，默认 20
 
 兼容 DeepSeek / OpenAI / Ollama / vLLM 等 `/chat/completions` 接口。
-Key 只从环境变量读，不写进代码、不落盘。
+Key 只从环境变量 / .env 读，不写进代码；.env 不会被提交。
 """
 from __future__ import annotations
 
@@ -20,6 +21,8 @@ import os
 import urllib.error
 import urllib.request
 from typing import Callable, Optional
+
+from wechatauto.env import load_dotenv
 
 DEFAULT_BASE = "https://api.deepseek.com/v1"
 DEFAULT_MODEL = "deepseek-chat"
@@ -71,6 +74,7 @@ def make_reply_fn(base: Optional[str] = None, key: Optional[str] = None,
                   timeout: Optional[float] = None
                   ) -> Optional[Callable[[str, str, str], Optional[str]]]:
     """构造 ``fn(text, sender, chat) -> reply|None``；没配 Key 返回 None。"""
+    load_dotenv()          # .env 只补缺失项，系统环境变量优先
     key = (key or _env("WECHATAUTO_AI_KEY"))
     if not key:
         return None

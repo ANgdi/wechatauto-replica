@@ -140,7 +140,7 @@ class AutoReplyApp:
         ttk.Checkbutton(row5, text="未命中规则时调用 AI",
                         variable=self.ai_var).pack(side="left", padx=6)
         ttk.Label(row5, foreground="#666",
-                  text="需先设 WECHATAUTO_AI_KEY"
+                  text="在 .env 填 WECHATAUTO_AI_KEY"
                   ).pack(side="left", padx=(4, 0))
 
         ctrl = ttk.Frame(self.root)
