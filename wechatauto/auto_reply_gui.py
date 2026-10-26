@@ -42,7 +42,7 @@ class AutoReplyApp:
         self.accounts = {}
 
         root.title("微信自动回复")
-        root.geometry("900x680")
+        root.geometry("900x720")
         root.minsize(780, 560)
         try:
             root.option_add("*Font", ("Microsoft YaHei UI", 10))
@@ -121,6 +121,28 @@ class AutoReplyApp:
         self.permin_var = tk.IntVar(value=6)
         ttk.Spinbox(row2, from_=1, to=60, textvariable=self.permin_var, width=4).pack(side="left")
 
+        row3 = ttk.Frame(opts)
+        row3.pack(fill="x", pady=(4, 0))
+        ttk.Label(row3, text="额外@别名：").pack(side="left", padx=(6, 2))
+        self.mention_names_var = tk.StringVar()
+        ttk.Entry(row3, textvariable=self.mention_names_var, width=16).pack(side="left")
+        ttk.Label(row3, foreground="#666", text="（逗号分隔）").pack(side="left", padx=(8, 0))
+
+        row4 = ttk.Frame(opts)
+        row4.pack(fill="x", pady=(2, 0))
+        ttk.Label(row4, foreground="#666",
+                  text="群聊触发：「!」开头或 @我/别名；私聊直接匹配规则。"
+                  ).pack(side="left", padx=6)
+
+        row5 = ttk.Frame(opts)
+        row5.pack(fill="x", pady=(2, 0))
+        self.ai_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row5, text="未命中规则时调用 AI",
+                        variable=self.ai_var).pack(side="left", padx=6)
+        ttk.Label(row5, foreground="#666",
+                  text="需先设 WECHATAUTO_AI_KEY"
+                  ).pack(side="left", padx=(4, 0))
+
         ctrl = ttk.Frame(self.root)
         ctrl.pack(fill="x", **pad)
         self.btn_start = ttk.Button(ctrl, text="启动", command=self._start)
@@ -189,6 +211,10 @@ class AutoReplyApp:
             "dry": bool(self.dry_var.get()),
             "verify": bool(self.verify_var.get()),
             "mention": bool(self.mention_var.get()),
+            "mention_names": [x.strip() for x in
+                              self.mention_names_var.get().replace("，", ",").split(",")
+                              if x.strip()],
+            "ai": bool(self.ai_var.get()),
             "prefix": self.prefix_var.get(),
             "cooldown": max(0.0, float(self.cool_var.get())),
             "permin": max(1, int(self.permin_var.get())),
@@ -242,9 +268,19 @@ class AutoReplyApp:
 
             sender = Sender(hwnd, self._log, verify=cfg["verify"], dry_run=cfg["dry"])
             sender.start()
+            ai_fn = None
+            if cfg["ai"]:
+                from wechatauto.ai_reply import make_reply_fn
+                ai_fn = make_reply_fn()
+                if ai_fn is None:
+                    self._log("已勾选 AI，但没读到 WECHATAUTO_AI_KEY，本次不使用 AI")
+                else:
+                    self._log("AI 已启用：规则未命中时调用模型")
             replier = AutoReplier(db, rules, sender, self._log,
                                   cooldown=cfg["cooldown"],
-                                  max_per_minute=cfg["permin"])
+                                  max_per_minute=cfg["permin"],
+                                  mention_names=cfg["mention_names"],
+                                  ai_fn=ai_fn)
             listener = Listener(db, interval=1.0)
 
             raw = [x.strip() for x in cfg["chats"].replace("，", ",").split(",") if x.strip()]

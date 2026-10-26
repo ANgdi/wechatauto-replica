@@ -217,11 +217,16 @@ def pid_is_weixin(pid: int) -> bool:
         return False
 
 
-def find_hwnd_for_account(account: str, db_dir: str = "") -> int:
+def find_hwnd_for_account(account: str, db_dir: str = "",
+                          attempts: int = 4, delay: float = 1.0) -> int:
     """按账号目录找**它自己的**微信主窗口（多开时必须）。
 
     多开时两个窗口标题都叫「微信」，只按尺寸挑最大的会绑到另一个号上。
     这里先用进程打开的文件把账号目录映射到 PID，再在该 PID 的 Qt 主窗里挑。
+
+    微信刚启动/刚登录时，进程可能还没打开 `db_storage` 里的文件，`open_files`
+    会短暂看不到账号 → 以前会直接判定“找不到窗口”。所以这里重试几次
+    （默认 4 次、间隔 1 秒），给客户端一点时间把库文件句柄建起来。
     """
     try:
         import psutil
@@ -235,44 +240,48 @@ def find_hwnd_for_account(account: str, db_dir: str = "") -> int:
     if not root:
         return 0
     base = os.path.normcase(os.path.abspath(os.path.join(root, account)))
-    pids = set()
-    for p in psutil.process_iter(["pid", "name"]):
-        if (p.info.get("name") or "").lower() != "weixin.exe":
-            continue
-        try:
-            for f in p.open_files():
-                if os.path.normcase(os.path.abspath(f.path)).startswith(base + os.sep):
-                    pids.add(p.info["pid"])
-                    break
-        except Exception:
-            continue
-    if not pids:
-        return 0
 
-    best = []
+    for attempt in range(max(1, attempts)):
+        pids = set()
+        for p in psutil.process_iter(["pid", "name"]):
+            if (p.info.get("name") or "").lower() != "weixin.exe":
+                continue
+            try:
+                for f in p.open_files():
+                    if os.path.normcase(os.path.abspath(f.path)).startswith(base + os.sep):
+                        pids.add(p.info["pid"])
+                        break
+            except Exception:
+                continue
+        if pids:
+            best = []
 
-    def cb(h, _):
-        try:
-            _, pid = win32process.GetWindowThreadProcessId(h)
-            if pid not in pids:
+            def cb(h, _):
+                try:
+                    _, pid = win32process.GetWindowThreadProcessId(h)
+                    if pid not in pids:
+                        return True
+                    if not win32gui.IsWindowVisible(h):
+                        return True
+                    if not win32gui.GetClassName(h).startswith("Qt51514QWindowIcon"):
+                        return True
+                    # 最小化的窗口 GetWindowRect 是 -16000 之类的值，用正常位置尺寸评分
+                    normal = win32gui.GetWindowPlacement(h)[4]
+                    w, ht = normal[2] - normal[0], normal[3] - normal[1]
+                    if w < 640 or ht < 520:
+                        return True
+                    best.append((w * ht, h))
+                except Exception:
+                    pass
                 return True
-            if not win32gui.IsWindowVisible(h):
-                return True
-            if not win32gui.GetClassName(h).startswith("Qt51514QWindowIcon"):
-                return True
-            # 最小化的窗口 GetWindowRect 是 -16000 之类的值，用正常位置尺寸评分
-            normal = win32gui.GetWindowPlacement(h)[4]
-            w, ht = normal[2] - normal[0], normal[3] - normal[1]
-            if w < 640 or ht < 520:
-                return True
-            best.append((w * ht, h))
-        except Exception:
-            pass
-        return True
 
-    win32gui.EnumWindows(cb, None)
-    best.sort(reverse=True)
-    return best[0][1] if best else 0
+            win32gui.EnumWindows(cb, None)
+            if best:
+                best.sort(reverse=True)
+                return best[0][1]
+        if attempt + 1 < attempts:
+            time.sleep(delay)
+    return 0
 
 
 def clean_text(text: str, is_group: bool) -> str:
@@ -412,7 +421,8 @@ class AutoReplier:
     def __init__(self, db, rules: RuleSet, sender: Sender, log: Log, *,
                  cooldown: float = 5.0, max_per_minute: int = 6,
                  max_age: float = 180.0, ignore=(), service_prefixes=(),
-                 service_suffixes=(), mention_names=(), echo_self: bool = False):
+                 service_suffixes=(), mention_names=(), echo_self: bool = False,
+                 ai_fn=None):
         self.db = db
         self.rules = rules
         self.sender = sender
@@ -420,6 +430,7 @@ class AutoReplier:
         self.cooldown = cooldown
         self.max_per_minute = max_per_minute
         self.max_age = max_age
+        self.ai_fn = ai_fn
         self.own_wxid = (db.get_self_info() or {}).get("username") or db.wxid or ""
         self.own_names = set(mention_names) | {self.own_wxid}
         try:
@@ -510,18 +521,33 @@ class AutoReplier:
                 return
             text_for_match = text.strip()
 
-        reply_tpl = self.rules.match(text_for_match, chat)
-        if reply_tpl is None:
-            reply_tpl = self.rules.default_reply
-        if not reply_tpl:
-            return
-        if self._rate_limited(chat):
-            self.log("跳过（冷却/频率限制）：%s" % display_name_of(self.db, chat))
-            return
-
         sender_name = self._sender_name(sender_wxid)
         chat_name = display_name_of(self.db, chat)
-        reply = render_template(reply_tpl, sender_name, chat_name, text_for_match)
+
+        matched = self.rules.match(text_for_match, chat)
+        use_ai = matched is None and self.ai_fn is not None
+        if not matched and not use_ai and not self.rules.default_reply:
+            return
+        # 频率限制放在调用 AI 之前，避免冷却期内白花 token
+        if self._rate_limited(chat):
+            self.log("跳过（冷却/频率限制）：%s" % chat_name)
+            return
+
+        reply = matched
+        if reply is None and use_ai:
+            ai_text = self.ai_fn(text_for_match, sender_name, chat_name)
+            if ai_text:
+                self.log("AI 回复：%s | %s: %s -> %s"
+                         % (chat_name, sender_name, text_for_match[:40], ai_text[:60]))
+                self.sender.submit(chat, chat_name, ai_text)
+                return
+            self.log("AI 没返回内容，改用兜底：%s" % chat_name)
+
+        if reply is None:
+            reply = self.rules.default_reply
+        if not reply:
+            return
+        reply = render_template(reply, sender_name, chat_name, text_for_match)
         self.log("命中：%s | %s: %s -> %s"
                  % (chat_name, sender_name, text_for_match[:40], reply[:60]))
         self.sender.submit(chat, chat_name, reply)
@@ -587,6 +613,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-age", type=float, default=180.0,
                    help="超过这个秒数的旧消息不回（0=不限）")
     p.add_argument("--dry-run", action="store_true", help="只打印将回复的内容，不点微信窗口")
+    p.add_argument("--ai", action="store_true",
+                   help="未命中规则时调用 OpenAI 兼容接口（Key 读 WECHATAUTO_AI_KEY）")
     p.add_argument("--no-verify", action="store_true", help="发送后不回读数据库确认")
     p.add_argument("--ignore", action="append", default=[], help="忽略的会话 username（可重复）")
     p.add_argument("--mention-name", action="append", default=[],
@@ -654,6 +682,15 @@ def main(argv=None) -> int:
     sender = Sender(hwnd, log, verify=not args.no_verify, dry_run=args.dry_run)
     sender.start()
 
+    ai_fn = None
+    if args.ai:
+        from wechatauto.ai_reply import make_reply_fn
+        ai_fn = make_reply_fn()
+        if ai_fn is None:
+            log("已勾选 --ai，但没读到 WECHATAUTO_AI_KEY，本次不使用 AI")
+        else:
+            log("AI 已启用：规则未命中时调用模型")
+
     replier = AutoReplier(
         db, rules, sender, log,
         cooldown=max(0.0, args.cooldown),
@@ -661,6 +698,7 @@ def main(argv=None) -> int:
         max_age=max(0.0, args.max_age),
         ignore=args.ignore,
         mention_names=args.mention_name,
+        ai_fn=ai_fn,
     )
 
     listener = Listener(db, interval=max(0.2, args.interval))

@@ -102,17 +102,50 @@ python -m wechatauto.demo_auto_reply --all --rules auto_reply_rules.json
 拟人节奏由库统一控制（默认 `natural`：写动作间隔 2.5–6s、120s 内 6 次）。
 想临时快一点：`$env:WECHATAUTO_RHYTHM="fast"`；默认档位不要改成 `off`。
 
-## 4. 接入 AI（可选）
+## 4. 接入 AI（可选，已内置）
 
-`AutoReplier.handle()` 里 `reply_tpl = self.rules.match(...)` 是唯一决定回复内容的地方。
-接 AI 的思路：
+代码在 `wechatauto/ai_reply.py`，走 **OpenAI 兼容** 的 `/chat/completions`
+（DeepSeek / OpenAI / Ollama / vLLM 都行）。Key 只从环境变量读，不写代码、不落盘。
 
-1. 在 `handle()` 里把 `text_for_match` 交给你的模型（本地 Ollama / 云端 API 均可）；
-2. **不要在回调线程里同步等模型**——回调线程只负责入队；
-   模型调用放到发送线程或单独的 worker，再把结果 `sender.submit(...)`；
-3. 给模型加超时（如 20s）和兜底话术，超时就回兜底，别让队列堆死。
+```powershell
+$env:WECHATAUTO_AI_KEY="sk-..."                          # 必填
+$env:WECHATAUTO_AI_BASE="https://api.deepseek.com/v1"     # 可选，默认就是这个
+$env:WECHATAUTO_AI_MODEL="deepseek-chat"                  # 可选
+# $env:WECHATAUTO_AI_SYSTEM="你是..."                     # 可选，系统提示词
+# $env:WECHATAUTO_AI_TIMEOUT="20"                         # 可选，秒
+```
 
-## 5. 排错
+然后：
+
+- **GUI**：勾「未命中规则时调用 AI」，启动后日志会显示 `AI 已启用`；
+- **命令行**：加 `--ai`。
+
+匹配顺序是 **规则命中 → AI → 兜底回复**。AI 调用在「每个会话自己的监听线程」里同步进行
+（带超时），只影响该会话，不会阻塞数据库轮询；超时/失败会退回兜底回复。
+
+Ollama 例子：
+
+```powershell
+$env:WECHATAUTO_AI_BASE="http://127.0.0.1:11434/v1"
+$env:WECHATAUTO_AI_MODEL="qwen2.5:7b"
+$env:WECHATAUTO_AI_KEY="ollama"      # 本地服务随便填一个非空值
+```
+
+## 5. 群聊怎么触发
+
+| 消息 | 是否触发 |
+|---|---|
+| 私聊「你好」 | ✅ 直接按规则匹配 |
+| 群聊「你好」 | ❌ 没有 @ 也没有前缀 |
+| 群聊「!你好」 | ✅ 去掉 `!` 后按「你好」匹配 |
+| 群聊「@焦糖可可陷阱 你好」 | ✅ @ 到本机昵称 |
+| 群聊「@木笛 你好」（换号登录时） | ❌ 不是当前账号的昵称 |
+| 群聊「@你的群昵称 你好」 | ⚠️ 群昵称和通讯录昵称不同，需在 GUI「额外@别名」或 CLI `--mention-name` 里加上 |
+
+- 前缀默认 `!`，可在 GUI「群触发前缀」或 CLI `--group-prefix` 改；留空则关闭前缀触发。
+- 群里回复目前是**普通文本**，不是真正的 @ 提醒（真 @ 需要点选成员弹层，稳定性不足）。
+
+## 6. 排错
 
 | 现象 | 原因 / 处理 |
 |---|---|
@@ -122,7 +155,7 @@ python -m wechatauto.demo_auto_reply --all --rules auto_reply_rules.json
 | 提示数据库重建 | 删 `%TEMP%\wechatauto_db\<账号>` 可强制重建；不要在解密中途杀进程 |
 | 回复发错人 | 显示名重名时 `open_chat` 可能歧义；用 wxid 明确目标，并保持 `verify=True` |
 
-## 6. 已知限制
+## 7. 已知限制
 
 - 微信必须**已登录且窗口可操作**；锁屏/远程桌面断开时发送会失败。
 - 群聊回复目前是普通文本，**不是真正的 @ 提醒**（真 @ 需要点选成员弹层，稳定性不足）。
