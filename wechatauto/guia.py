@@ -2283,7 +2283,15 @@ class WeChatGUI:
                             continue   # 比水位旧的一定不是这次发的
                         if (seq, int(m.get('local_id') or 0)) in after['ids']:
                             continue
-                    if m.get('sender_id') != 2:
+                    # issue #34：sender_id 是**分行分片** Name2Id 的 rowid，自己
+                    # 并不总是 2（本机实测 2/4/1），拿常量判会把自己发的消息跳过，
+                    # 表现就是「明明发出去了却报数据库未确认」。用本机 wxid 对比；
+                    # 拿不到 wxid 的旧环境才退回旧常量。
+                    own = (getattr(db, 'wxid', '') or '').strip()
+                    if own:
+                        if (m.get('sender_username') or '') != own:
+                            continue
+                    elif m.get('sender_id') != 2:
                         continue
                     content = m.get('content') or ''
                     if content == text if mode == 'exact' else text in content:

@@ -97,7 +97,7 @@ python -m wechatauto.demo_auto_reply --all --rules auto_reply_rules.json
 | 旧消息不回 | 180s | `--max-age 0` 关闭 |
 | 同会话冷却 | 5s | `--cooldown` |
 | 每分钟上限 | 6 条 | `--max-per-minute` |
-| 发送确认 | ✅ | `verify=True` 从数据库回读；**未确认不重发**（防重复） |
+| 发送确认 | 默认关 | 需要时加 `--verify` / GUI 勾选；微信落库可能晚于 8 秒，开回读会慢且可能**误报“未确认”**（消息其实已发出）。无论开不开，**未确认都不会重发** |
 
 拟人节奏由库统一控制（默认 `natural`：写动作间隔 2.5–6s、120s 内 6 次）。
 想临时快一点：`$env:WECHATAUTO_RHYTHM="fast"`；默认档位不要改成 `off`。
@@ -163,7 +163,7 @@ WECHATAUTO_AI_KEY=ollama
 | 发送失败/未确认 | 微信窗口被锁屏、最小化到托盘、或 UIA 被重置；重跑一次，或先 `wechatauto doctor` |
 | 第一次查询很慢（30s~2min） | 大库首次解密，属正常；之后走增量 WAL 合并（本仓库已修） |
 | 提示数据库重建 | 删 `%TEMP%\wechatauto_db\<账号>` 可强制重建；不要在解密中途杀进程 |
-| 回复发错人 | 显示名重名时 `open_chat` 可能歧义；用 wxid 明确目标，并保持 `verify=True` |
+| 回复发错人 | 显示名重名时 `open_chat` 可能歧义；用 wxid 明确目标 |
 
 ## 7. 已知限制
 

@@ -53,8 +53,10 @@ try:
 except AttributeError:
     pass
 
-# 群聊正文形如 "wxid_xxx:\n正文"（图片等非文本消息也带这个前缀）
-_GROUP_PREFIX_RE = re.compile(r"^\s*(?:wxid_[0-9A-Za-z_\-]{3,}|[0-9]{5,}@openim):\s*\n?")
+# 群聊正文形如 "<发送者>:\n正文"（图片等非文本消息也带这个前缀）。
+# 发送者不一定是 wxid_ 开头：自定义微信号（如 z84772180）也会出现在这里，
+# 所以按「2 个以上合法用户名字符 + 冒号 + 换行」通用匹配，避免前缀漏剥。
+_GROUP_PREFIX_RE = re.compile(r"^\s*[0-9A-Za-z_@.\-]{2,}:[ \t]*\r?\n")
 # 微信 @ 后面常跟 U+2005（四分之一空格）而不是普通空格
 _MENTION_SPACES = str.maketrans({"\u2005": " ", "\u00a0": " ", "\u3000": " "})
 
@@ -312,6 +314,11 @@ def resolve_chat(db, raw: str) -> Optional[str]:
         if nickmap.get(s["username"]) == raw:
             return s["username"]
     hits = db.search_contact(raw)
+    # 自定义微信号（如 lee65786）既不是 wxid_ 开头，也不一定出现在会话列表里，
+    # 但 contact.db 的 username 精确相等时就是它本身。
+    for h in hits:
+        if h.get("username") == raw:
+            return raw
     exact = [h for h in hits if raw in (h.get("nick_name"), h.get("remark"))]
     if len(exact) == 1:
         return exact[0]["username"]
@@ -341,7 +348,7 @@ def render_template(tpl: str, sender: str, chat: str, content: str) -> str:
 class Sender(threading.Thread):
     """唯一发送线程：构造并独占 WeChatGUI，串行执行所有回复。"""
 
-    def __init__(self, hwnd: Optional[int], log: Log, verify: bool = True,
+    def __init__(self, hwnd: Optional[int], log: Log, verify: bool = False,
                  dry_run: bool = False):
         super().__init__(name="wx-auto-reply-sender", daemon=True)
         self.hwnd = hwnd
@@ -574,6 +581,9 @@ def self_test() -> int:
         ("现在几点？", False, "现在是 {time}。"),
         ("/help", False, "可用指令：/help"),
         ("随便说点什么", False, "收到，稍后回复你。"),
+        # 群聊正文带发送者前缀：自定义微信号（不是 wxid_ 开头）也要剥掉
+        ("z84772180:\n你好", True, "你好呀，我是自动回复机器人。"),
+        ("wxid_abc:\n你好", True, "你好呀，我是自动回复机器人。"),
     ]
     bad = 0
 
@@ -615,7 +625,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="只打印将回复的内容，不点微信窗口")
     p.add_argument("--ai", action="store_true",
                    help="未命中规则时调用 OpenAI 兼容接口（Key 读 WECHATAUTO_AI_KEY）")
-    p.add_argument("--no-verify", action="store_true", help="发送后不回读数据库确认")
+    p.add_argument("--verify", dest="verify", action="store_true",
+                   help="发送后回读数据库确认（默认关闭：微信落库可能晚于 8 秒，会误报）")
+    p.add_argument("--no-verify", dest="verify", action="store_false",
+                   help=argparse.SUPPRESS)
     p.add_argument("--ignore", action="append", default=[], help="忽略的会话 username（可重复）")
     p.add_argument("--mention-name", action="append", default=[],
                    help="群里 @ 自己的别名（默认自动加本机昵称，可重复）")
@@ -679,7 +692,7 @@ def main(argv=None) -> int:
     if not hwnd:
         log("dry-run：未找到微信主窗口，仍只做规则匹配（不会发送）")
 
-    sender = Sender(hwnd, log, verify=not args.no_verify, dry_run=args.dry_run)
+    sender = Sender(hwnd, log, verify=args.verify, dry_run=args.dry_run)
     sender.start()
 
     ai_fn = None
