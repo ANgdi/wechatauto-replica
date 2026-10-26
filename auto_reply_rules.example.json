@@ -1,0 +1,30 @@
+{
+  "_说明": "规则按顺序匹配，先命中先回复；match 支持子串、正则(regex=true)、整句(exact=true)。reply 支持 {sender}/{chat}/{content}/{time} 占位符。",
+  "group_prefix": "!",
+  "group_require_mention": true,
+  "group_mention_any": false,
+  "default_reply": "",
+  "rules": [
+    {
+      "match": ["你好", "您好", "hello", "hi"],
+      "reply": "你好，我是自动回复机器人～"
+    },
+    {
+      "match": ["几点", "时间"],
+      "reply": "现在是 {time}。"
+    },
+    {
+      "match": ["/help", "帮助"],
+      "reply": "可用指令：/help、时间、你好。"
+    },
+    {
+      "match": ["在吗", "在不在"],
+      "reply": "{sender}，我在的，有事请直接说。"
+    },
+    {
+      "match": ["^(?:/ping|ping)$"],
+      "regex": true,
+      "reply": "pong"
+    }
+  ]
+}

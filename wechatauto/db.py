@@ -42,7 +42,18 @@ from wechatauto.logger import wxlog
 
 PAGE_SZ = 4096
 RESERVE_SZ = 80  # IV(16) + HMAC(64)
-STAMP_VERSION = 3  # v3: stamp 内 mtime 改用 %r 完整精度（%f 只留 6 位小数，与 Windows 7 位小数比较恒不等→每秒重建缓存→磁盘 50MB/s 读+写）
+STAMP_VERSION = 4  # v4: stamp 增加 WAL salt，主库未变时只增量合并 WAL 新帧（2GB 库不再每次新消息整库重解）
+# v3: stamp 内 mtime 改用 %r 完整精度（%f 只留 6 位小数，与 Windows 7 位小数比较恒不等→每秒重建缓存→磁盘 50MB/s 读+写）
+
+# 解密缓存构建锁：按缓存文件绝对路径共享，**进程内所有 WeChatDB 实例共用**。
+# 以前锁挂在实例上，发送校验和监听各建一个 WeChatDB 时会同时重建同一份库，
+# 既重复重活，也会互相踩缓存文件。
+_BUILD_LOCKS = {}
+_BUILD_LOCKS_GUARD = threading.Lock()
+# 消息库的「读」与「增量写」互斥：增量合并是**就地写入**缓存副本，
+# 若另一个线程正拿着同一文件的连接查询，可能读到写了一半的页。
+# 只包住消息库查询（get_messages / get_new_messages 等），不拦联系人/会话库。
+_CACHE_IO_LOCK = threading.RLock()
 CONFIG_CIPHER_NAME = b"com.Tencent.WCDB.Config.Cipher"
 CONFIG_XOR_MASK = bytes.fromhex(
     "d2c7442458020000004889442450488b"
@@ -1345,19 +1356,25 @@ class WeChatDB:
               "python -m wechatauto.diagnose_keys", file=sys.stderr)
 
     def _build_lock_for(self, rel: str) -> threading.Lock:
-        """按库文件取一把构建锁（注册表本身用一把小锁保护）。"""
-        reg = getattr(self, "_build_locks", None)
-        if reg is None:
-            reg = self._build_locks = {}
-            self._build_locks_guard = threading.Lock()
-        with self._build_locks_guard:
-            return reg.setdefault(rel, threading.Lock())
+        """按缓存文件取一把构建锁（进程内共享，注册表本身用一把小锁保护）。"""
+        try:
+            key = os.path.abspath(os.path.join(
+                self.workdir, rel.replace(os.sep, "__")))
+        except Exception:
+            key = rel
+        with _BUILD_LOCKS_GUARD:
+            return _BUILD_LOCKS.setdefault(key, threading.Lock())
 
     def _open(self, rel: str) -> sqlite3.Connection:
         """同一份库的并发解密要串行：两个线程各自解一遍是几秒级的重复重活，
-        还会互相踩中间产物（监听所有会话时几百个会话同时开库必现）。"""
-        with self._build_lock_for(rel):
-            return self._open_unlocked(rel)
+        还会互相踩中间产物（监听所有会话时几百个会话同时开库必现）。
+
+        锁序固定为 ``_CACHE_IO_LOCK → 按库构建锁``：增量合并会就地写缓存，
+        必须与消息库查询互斥；反过来先拿构建锁再等查询锁会死锁。
+        """
+        with _CACHE_IO_LOCK:
+            with self._build_lock_for(rel):
+                return self._open_unlocked(rel)
 
     def _open_unlocked(self, rel: str) -> sqlite3.Connection:
         """打开解密(并合并 -wal 增量)后的只读库。
@@ -1397,26 +1414,26 @@ class WeChatDB:
         wal_path = self._wal_path(rel)
         wal_mtime = os.path.getmtime(wal_path) if wal_path else 0.0
         wal_size = os.path.getsize(wal_path) if wal_path else 0
+        wal_salt = self._wal_salt(wal_path)
         stamp = dst + ".stamp"
-        old = None
-        if os.path.exists(stamp):
-            try:
-                with open(stamp, "r") as f:
-                    parts = f.read().split(",")
-                old = {
-                    "ver": int(parts[0]),
-                    "mtime": float(parts[1]),
-                    "size": int(parts[2]),
-                    "wal_mtime": float(parts[3]),
-                    "wal_size": int(parts[4]),
-                    "applied": int(parts[5]),
-                }
-                if old["ver"] != STAMP_VERSION:
-                    old = None
-            except (ValueError, OSError, IndexError):
-                old = None
-        build = (not old or old["mtime"] != src_mtime or old["size"] != src_size
-                 or old["wal_mtime"] != wal_mtime or old["wal_size"] != wal_size)
+        old = self._read_stamp(stamp)
+        # 主库自上次构建后没变 → 现有缓存副本仍可当底线，只需处理 WAL：
+        #   ① WAL 也没变，直接复用（一次 stat 就够）；
+        #   ② 只有 WAL 追加/改写，增量合并新帧（秒级），不再整库重解。
+        # 主库变了（checkpoint 就地改写）或 WAL 被重置（salt 换代）才全量重建。
+        base_same = bool(old and os.path.exists(dst)
+                         and old["mtime"] == src_mtime
+                         and old["size"] == src_size)
+        wal_same = bool(old and old["wal_mtime"] == wal_mtime
+                        and old["wal_size"] == wal_size)
+        build = True
+        applied = 0
+        if base_same and wal_same:
+            build = False
+        elif base_same and self._try_incremental_wal(
+                dst, wal_path, key, old, wal_salt,
+                wal_mtime, wal_size, stamp):
+            build = False
         # 构建策略：**先做主库自洽快照当底线，再尝试合并 WAL**。
         # 主库在上次 checkpoint 时是自洽的（SQLite 保证），所以「仅解密主库」
         # 一定可读，代价是可能缺最近少量消息；WAL 合并成功则用更新的那份。
@@ -1427,7 +1444,6 @@ class WeChatDB:
         # 几百个会话同时开库时必现）。唯一命名后异常退出会留下残留文件，故构建前
         # 顺手清掉 10 分钟前的陈旧中间产物。
         tmp = "%s.%d.%x.tmp" % (dst, os.getpid(), threading.get_ident())
-        applied = 0
         if build:
             for stale in glob.glob(dst + ".*.tmp*"):
                 try:
@@ -1477,8 +1493,9 @@ class WeChatDB:
                 applied = best_applied
                 os.makedirs(os.path.dirname(stamp), exist_ok=True)
                 with open(stamp, "w") as f:
-                    f.write("%d,%r,%d,%r,%d,%d"
-                            % (STAMP_VERSION, src_mtime, src_size, wal_mtime, wal_size, applied))
+                    f.write("%d,%r,%d,%r,%d,%d,%s"
+                            % (STAMP_VERSION, src_mtime, src_size,
+                               wal_mtime, wal_size, applied, wal_salt))
             build = False
         conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
@@ -1504,11 +1521,114 @@ class WeChatDB:
         except sqlite3.Error:
             return False
 
+    @staticmethod
+    def _read_stamp(stamp: str) -> Optional[dict]:
+        """读构建标记；版本不符/字段缺失视为无标记（触发一次全量重建）。"""
+        if not os.path.exists(stamp):
+            return None
+        try:
+            with open(stamp, "r") as f:
+                parts = f.read().split(",")
+            if len(parts) < 7:
+                return None
+            old = {
+                "ver": int(parts[0]),
+                "mtime": float(parts[1]),
+                "size": int(parts[2]),
+                "wal_mtime": float(parts[3]),
+                "wal_size": int(parts[4]),
+                "applied": int(parts[5]),
+                "salt": parts[6].strip(),
+            }
+        except (ValueError, OSError, IndexError):
+            return None
+        return old if old["ver"] == STAMP_VERSION else None
+
+    @staticmethod
+    def _wal_salt(wal_path: Optional[str]) -> str:
+        """当前 WAL 头的 salt（十六进制）；没有 WAL 返回空串。
+
+        微信 checkpoint 会重置 WAL 并换 salt，旧世代帧不能再合并。
+        """
+        if not wal_path:
+            return ""
+        try:
+            with open(wal_path, "rb") as f:
+                hdr = f.read(32)
+        except OSError:
+            return ""
+        return hdr[16:24].hex() if len(hdr) == 32 else ""
+
+    @staticmethod
+    def _check_light(dst: str) -> bool:
+        """增量合并后的快速校验：只读 schema 页，不跑全库 quick_check。
+
+        2GB 级的库跑一次 quick_check 要 20s+，增量合并每次新消息都跑就失去
+        意义；这里只确认库能打开、schema 可读。页级合法性在 _merge_wal 里
+        逐页校验（页类型 / 页 1 magic），失败会退回全量重建。
+        """
+        try:
+            conn = sqlite3.connect(f"file:{dst}?mode=ro", uri=True)
+            try:
+                conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            finally:
+                conn.close()
+            return True
+        except sqlite3.Error:
+            return False
+
+    def _try_incremental_wal(self, dst: str, wal_path: Optional[str], key: bytes,
+                             old: dict, wal_salt: str, wal_mtime: float,
+                             wal_size: int, stamp: str) -> bool:
+        """增量合并串行化入口：与消息库查询共用 _CACHE_IO_LOCK。"""
+        with _CACHE_IO_LOCK:
+            return self._try_incremental_wal_locked(
+                dst, wal_path, key, old, wal_salt, wal_mtime, wal_size, stamp)
+
+    def _try_incremental_wal_locked(self, dst: str, wal_path: Optional[str],
+                                    key: bytes, old: dict, wal_salt: str,
+                                    wal_mtime: float, wal_size: int,
+                                    stamp: str) -> bool:
+        """主库未变时，只把 WAL 新增帧合并进现有缓存副本（失败则全量重建）。
+
+        前置条件缺一不可：上次记录过已合并帧号、WAL salt 未换代、当前帧数
+        不少于已合并帧数。合并只取到最后一个 commit 帧为止——WAL 尾部可能是
+        写了一半的事务，把这些页读进来会让缓存出现未提交数据。
+        """
+        if not wal_path or not wal_salt or old.get("salt") != wal_salt:
+            return False
+        from_frame = old.get("applied", -1)
+        if from_frame < 0:
+            return False
+        frames = max(0, (wal_size - self.WAL_HEADER_SZ) // self.WAL_FRAME_SZ)
+        if frames < from_frame:
+            return False
+        try:
+            applied = self._merge_wal(dst, wal_path, key, from_frame,
+                                      commit_only=True)
+        except Exception as exc:
+            wxlog.debug('WAL 增量合并失败，回退全量重建：%r' % (exc,))
+            return False
+        if not self._check_light(dst):
+            wxlog.debug('WAL 增量合并后校验失败，回退全量重建：%s'
+                        % os.path.basename(dst))
+            return False
+        try:
+            os.makedirs(os.path.dirname(stamp), exist_ok=True)
+            with open(stamp, "w") as f:
+                f.write("%d,%r,%d,%r,%d,%d,%s"
+                        % (STAMP_VERSION, old["mtime"], old["size"],
+                           wal_mtime, wal_size, applied, wal_salt))
+        except OSError:
+            return False
+        return True
+
     def _wal_path(self, rel: str) -> Optional[str]:
         wal = self._db_path(rel) + "-wal"
         return wal if os.path.exists(wal) else None
 
-    def _merge_wal(self, dst: str, wal_path: str, key: bytes, from_frame: int) -> int:
+    def _merge_wal(self, dst: str, wal_path: str, key: bytes, from_frame: int,
+                   commit_only: bool = False) -> int:
         """把 -wal 中的加密帧按页号覆盖进已解密的主库文件，返回已应用帧数。
 
         帧结构（WCDB，全部大端）：[0:4] 页号, [4:8] 提交标记, [8:16] salt, [16:24] 校验。
@@ -1517,6 +1637,10 @@ class WeChatDB:
 
         只合并 salt 与当前 WAL 头一致的帧：微信 checkpoint 会重置 WAL（salt+1 并
         清零写游标），旧世代帧若被合并会用过期页覆盖新数据，造成库损坏。
+
+        ``commit_only=True`` 时只合并到最后一个 commit 帧（[4:8] != 0）为止，
+        供增量监听路径使用：WAL 尾部可能是写到一半的事务。全量重建仍按旧行为
+        合并全部帧（随后整库 quick_check 兜底）。
         """
         if not os.path.exists(dst):
             return 0
@@ -1530,7 +1654,20 @@ class WeChatDB:
                 wal_salt = wal_hdr[16:24]
                 wal_size = os.path.getsize(wal_path)
                 n = (wal_size - self.WAL_HEADER_SZ) // self.WAL_FRAME_SZ
-                for i in range(from_frame, n):
+                limit = n
+                if commit_only:
+                    last_commit = None
+                    for i in range(from_frame, n):
+                        wal.seek(self.WAL_HEADER_SZ + i * self.WAL_FRAME_SZ)
+                        hdr = wal.read(24)
+                        if len(hdr) < 24:
+                            break
+                        if struct.unpack(">I", hdr[4:8])[0]:
+                            last_commit = i
+                    if last_commit is None:
+                        return from_frame      # 还没有新提交，保持原已合并位置
+                    limit = last_commit + 1
+                for i in range(from_frame, limit):
                     wal.seek(self.WAL_HEADER_SZ + i * self.WAL_FRAME_SZ)
                     hdr = wal.read(24)
                     page = wal.read(PAGE_SZ)
@@ -1700,6 +1837,11 @@ class WeChatDB:
         return found
 
     def _run_msg_query(self, user: str, build):
+        """消息库查询入口：与 WAL 增量合并互斥（就地写缓存时不能有并发读）。"""
+        with _CACHE_IO_LOCK:
+            return self._run_msg_query_locked(user, build)
+
+    def _run_msg_query_locked(self, user: str, build):
         """对消息库执行只读查询；查询到库损坏时清缓存重建并重试一次。
 
         build(tables) -> rows，其中 tables 为 List[(conn, table)]，覆盖该
