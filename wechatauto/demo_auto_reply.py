@@ -429,7 +429,7 @@ class AutoReplier:
                  cooldown: float = 5.0, max_per_minute: int = 6,
                  max_age: float = 180.0, ignore=(), service_prefixes=(),
                  service_suffixes=(), mention_names=(), echo_self: bool = False,
-                 ai_fn=None):
+                 ai_fn=None, memory=None):
         self.db = db
         self.rules = rules
         self.sender = sender
@@ -438,6 +438,7 @@ class AutoReplier:
         self.max_per_minute = max_per_minute
         self.max_age = max_age
         self.ai_fn = ai_fn
+        self.memory = memory
         self.own_wxid = (db.get_self_info() or {}).get("username") or db.wxid or ""
         self.own_names = set(mention_names) | {self.own_wxid}
         try:
@@ -542,8 +543,15 @@ class AutoReplier:
 
         reply = matched
         if reply is None and use_ai:
-            ai_text = self.ai_fn(text_for_match, sender_name, chat_name)
+            history = self.memory.get(chat) if self.memory else None
+            # 群里多人共用一个会话记忆，正文带上发送者，模型才分得清谁说的
+            user_line = ("%s：%s" % (sender_name, text_for_match)
+                         if is_group else text_for_match)
+            ai_text = self.ai_fn(user_line, sender_name, chat_name, history)
             if ai_text:
+                if self.memory:
+                    self.memory.add(chat, "user", user_line)
+                    self.memory.add(chat, "assistant", ai_text)
                 self.log("AI 回复：%s | %s: %s -> %s"
                          % (chat_name, sender_name, text_for_match[:40], ai_text[:60]))
                 self.sender.submit(chat, chat_name, ai_text)
@@ -624,7 +632,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="超过这个秒数的旧消息不回（0=不限）")
     p.add_argument("--dry-run", action="store_true", help="只打印将回复的内容，不点微信窗口")
     p.add_argument("--ai", action="store_true",
-                   help="未命中规则时调用 OpenAI 兼容接口（Key 读 WECHATAUTO_AI_KEY）")
+                   help="调用 OpenAI 兼容接口（未命中规则时；没有规则就是纯 AI）")
+    p.add_argument("--ocr", action="store_true",
+                   help="允许 OCR 兜底（默认关闭：UIA 失败时宁可报错，也不在界面上盲点）")
+    p.add_argument("--memory-turns", type=int, default=10,
+                   help="每个会话保留的对话轮数（0=关闭记忆）")
+    p.add_argument("--memory-chars", type=int, default=3000,
+                   help="每个会话记忆的总字符上限")
+    p.add_argument("--memory-file", default="",
+                   help="记忆文件路径（默认 memory/auto_reply_<账号>.json）")
+    p.add_argument("--no-memory", action="store_true", help="关闭会话记忆")
     p.add_argument("--verify", dest="verify", action="store_true",
                    help="发送后回读数据库确认（默认关闭：微信落库可能晚于 8 秒，会误报）")
     p.add_argument("--no-verify", dest="verify", action="store_false",
@@ -645,6 +662,11 @@ def main(argv=None) -> int:
         return self_test()
 
     log = Log(args.log_file)
+    # 自动回复默认关闭 OCR 兜底：UIA 打不开会话时宁可失败，也不要在界面上盲点
+    # （盲点可能最小化几十个窗口，甚至点到退出登录）。
+    from wechatauto.param import WxParam
+    WxParam.ENABLE_OCR = bool(args.ocr)
+    log("OCR 兜底：%s" % ("开启" if args.ocr else "关闭（默认，避免盲点）"))
 
     # 规则
     rules = RuleSet.from_json(args.rules) if args.rules else RuleSet()
@@ -656,8 +678,8 @@ def main(argv=None) -> int:
         rules.group_mention_any = True
     if args.no_mention_only:
         rules.group_require_mention = False
-    if not rules.rules and not rules.default_reply:
-        log("没有可用规则：用 --rules 或 --default-reply 指定。先跑 --self-test 看格式。")
+    if not rules.rules and not rules.default_reply and not args.ai:
+        log("没有可回复内容：用 --rules / --default-reply，或加 --ai 走纯 AI。")
         return 2
 
     # 监听目标
@@ -667,6 +689,19 @@ def main(argv=None) -> int:
     db = WeChatDB(account=args.account) if args.account else WeChatDB()
     info = db.get_self_info()
     log("账号：%s（%s）" % (info.get("nick_name") or info.get("username"), db.wxid))
+
+    memory = None
+    if not args.no_memory and args.memory_turns > 0:
+        from wechatauto.chat_memory import ChatMemory
+        mem_path = args.memory_file or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "memory", "auto_reply_%s.json" % db.account)
+        memory = ChatMemory(mem_path, max_turns=args.memory_turns,
+                            max_chars=args.memory_chars)
+        log("会话记忆：每会话 %d 轮 / %d 字（%s）"
+            % (args.memory_turns, args.memory_chars, mem_path))
+    else:
+        log("会话记忆：关闭")
 
     targets: List[str] = []
     if args.all:
@@ -712,6 +747,7 @@ def main(argv=None) -> int:
         ignore=args.ignore,
         mention_names=args.mention_name,
         ai_fn=ai_fn,
+        memory=memory,
     )
 
     listener = Listener(db, interval=max(0.2, args.interval))

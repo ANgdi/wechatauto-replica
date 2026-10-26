@@ -37,18 +37,27 @@ def _env(name: str, default: str = "") -> str:
 
 
 def _chat(base: str, key: str, model: str, system: str,
-          text: str, sender: str, chat: str, timeout: float) -> Optional[str]:
+          text: str, sender: str, chat: str, timeout: float,
+          history: Optional[list] = None) -> Optional[str]:
     url = base.rstrip("/") + "/chat/completions"
+    messages = [{"role": "system", "content": system}]
+    for m in history or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+            messages.append({"role": role, "content": content})
+    messages.append({
+        "role": "user",
+        "content": "聊天对象：%s\n发送者：%s\n对方消息：%s\n请直接给出回复内容。"
+                   % (chat, sender, text),
+    })
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content":
-                "聊天对象：%s\n发送者：%s\n对方消息：%s\n请直接给出回复内容。"
-                % (chat, sender, text)},
-        ],
+        "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 200,
+        "max_tokens": 300,
     }
     req = urllib.request.Request(
         url,
@@ -72,7 +81,7 @@ def _chat(base: str, key: str, model: str, system: str,
 def make_reply_fn(base: Optional[str] = None, key: Optional[str] = None,
                   model: Optional[str] = None, system: Optional[str] = None,
                   timeout: Optional[float] = None
-                  ) -> Optional[Callable[[str, str, str], Optional[str]]]:
+                  ) -> Optional[Callable[..., Optional[str]]]:
     """构造 ``fn(text, sender, chat) -> reply|None``；没配 Key 返回 None。"""
     load_dotenv()          # .env 只补缺失项，系统环境变量优先
     key = (key or _env("WECHATAUTO_AI_KEY"))
@@ -87,7 +96,9 @@ def make_reply_fn(base: Optional[str] = None, key: Optional[str] = None,
     except ValueError:
         timeout = 20.0
 
-    def fn(text: str, sender: str, chat: str) -> Optional[str]:
-        return _chat(base, key, model, system, text, sender, chat, timeout)
+    def fn(text: str, sender: str, chat: str,
+           history: Optional[list] = None) -> Optional[str]:
+        return _chat(base, key, model, system, text, sender, chat,
+                     timeout, history=history)
 
     return fn

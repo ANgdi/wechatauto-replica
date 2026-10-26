@@ -92,7 +92,7 @@ class AutoReplyApp:
         cfg.columnconfigure(1, weight=1)
 
         ttk.Label(cfg, text="规则文件：").grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        self.rules_var = tk.StringVar(value=_default_rules_path())
+        self.rules_var = tk.StringVar(value="")
         ttk.Entry(cfg, textvariable=self.rules_var).grid(row=0, column=1, sticky="we")
         ttk.Button(cfg, text="浏览…", command=self._pick_rules).grid(row=0, column=2, padx=6)
 
@@ -136,12 +136,22 @@ class AutoReplyApp:
 
         row5 = ttk.Frame(opts)
         row5.pack(fill="x", pady=(2, 0))
-        self.ai_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row5, text="未命中规则时调用 AI",
+        self.ai_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row5, text="用 AI 回复（没有规则时就是纯 AI）",
                         variable=self.ai_var).pack(side="left", padx=6)
         ttk.Label(row5, foreground="#666",
                   text="在 .env 填 WECHATAUTO_AI_KEY"
                   ).pack(side="left", padx=(4, 0))
+
+        row6 = ttk.Frame(opts)
+        row6.pack(fill="x", pady=(2, 0))
+        ttk.Label(row6, text="记忆轮数：").pack(side="left", padx=(6, 2))
+        self.memory_turns_var = tk.IntVar(value=10)
+        ttk.Spinbox(row6, from_=0, to=50, textvariable=self.memory_turns_var,
+                    width=4).pack(side="left")
+        ttk.Label(row6, foreground="#666",
+                  text="（0=关闭；每个会话独立，默认 10 轮 / 3000 字）"
+                  ).pack(side="left", padx=(6, 0))
 
         ctrl = ttk.Frame(self.root)
         ctrl.pack(fill="x", **pad)
@@ -197,8 +207,8 @@ class AutoReplyApp:
             return
         rules_path = self.rules_var.get().strip()
         default = self.default_var.get().strip()
-        if not rules_path and not default:
-            messagebox.showwarning("提示", "规则文件和兜底回复至少填一个，否则没有可回的内容")
+        if not rules_path and not default and not self.ai_var.get():
+            messagebox.showwarning("提示", "规则文件、兜底回复、AI 至少开一个，否则没有可回的内容")
             return
         if rules_path and not os.path.exists(rules_path):
             messagebox.showwarning("提示", "规则文件不存在：\n%s" % rules_path)
@@ -215,6 +225,7 @@ class AutoReplyApp:
                               self.mention_names_var.get().replace("，", ",").split(",")
                               if x.strip()],
             "ai": bool(self.ai_var.get()),
+            "memory_turns": max(0, int(self.memory_turns_var.get())),
             "prefix": self.prefix_var.get(),
             "cooldown": max(0.0, float(self.cool_var.get())),
             "permin": max(1, int(self.permin_var.get())),
@@ -245,6 +256,11 @@ class AutoReplyApp:
                                                 resolve_chat)
         listener = sender = None
         try:
+            # 自动回复默认不让 OCR 兜底：UIA 打不开会话时宁可失败，
+            # 也不要盲点界面（盲点可能最小化一堆窗口，甚至点到退出登录）。
+            from wechatauto.param import WxParam
+            WxParam.ENABLE_OCR = False
+            self._log("OCR 兜底：关闭（UIA 打不开会话时会报错，不会盲点）")
             self._log("加载账号数据库（首次可能需要 10–60 秒）…")
             db = WeChatDB(account=cfg["account"])
             info = db.get_self_info()
@@ -275,12 +291,23 @@ class AutoReplyApp:
                 if ai_fn is None:
                     self._log("已勾选 AI，但没读到 WECHATAUTO_AI_KEY，本次不使用 AI")
                 else:
-                    self._log("AI 已启用：规则未命中时调用模型")
+                    self._log("AI 已启用：没命中规则时调用模型")
+            memory = None
+            if cfg["memory_turns"] > 0:
+                from wechatauto.chat_memory import ChatMemory
+                mem_path = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "memory", "auto_reply_%s.json" % cfg["account"])
+                memory = ChatMemory(mem_path, max_turns=cfg["memory_turns"],
+                                    max_chars=3000)
+                self._log("会话记忆：每会话 %d 轮 / 3000 字" % cfg["memory_turns"])
+            else:
+                self._log("会话记忆：关闭")
             replier = AutoReplier(db, rules, sender, self._log,
                                   cooldown=cfg["cooldown"],
                                   max_per_minute=cfg["permin"],
                                   mention_names=cfg["mention_names"],
-                                  ai_fn=ai_fn)
+                                  ai_fn=ai_fn, memory=memory)
             listener = Listener(db, interval=1.0)
 
             raw = [x.strip() for x in cfg["chats"].replace("，", ",").split(",") if x.strip()]
