@@ -38,7 +38,7 @@ def _env(name: str, default: str = "") -> str:
 
 def _chat(base: str, key: str, model: str, system: str,
           text: str, sender: str, chat: str, timeout: float,
-          history: Optional[list] = None) -> Optional[str]:
+          history: Optional[list] = None, max_tokens: int = 2000) -> Optional[str]:
     url = base.rstrip("/") + "/chat/completions"
     messages = [{"role": "system", "content": system}]
     for m in history or []:
@@ -57,7 +57,7 @@ def _chat(base: str, key: str, model: str, system: str,
         "model": model,
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 300,
+        "max_tokens": max(256, int(max_tokens)),
     }
     req = urllib.request.Request(
         url,
@@ -80,9 +80,14 @@ def _chat(base: str, key: str, model: str, system: str,
 
 def make_reply_fn(base: Optional[str] = None, key: Optional[str] = None,
                   model: Optional[str] = None, system: Optional[str] = None,
-                  timeout: Optional[float] = None
+                  timeout: Optional[float] = None,
+                  max_chars: int = 2000
                   ) -> Optional[Callable[..., Optional[str]]]:
-    """构造 ``fn(text, sender, chat) -> reply|None``；没配 Key 返回 None。"""
+    """构造 ``fn(text, sender, chat, history) -> reply|None``；没配 Key 返回 None。
+
+    ``max_chars`` 用来估算 API 的 ``max_tokens``（中文约 1 字 1 token），
+    真正的硬截断由调用方（AutoReplier）负责。
+    """
     load_dotenv()          # .env 只补缺失项，系统环境变量优先
     key = (key or _env("WECHATAUTO_AI_KEY"))
     if not key:
@@ -95,10 +100,11 @@ def make_reply_fn(base: Optional[str] = None, key: Optional[str] = None,
                         else _env("WECHATAUTO_AI_TIMEOUT", "20"))
     except ValueError:
         timeout = 20.0
+    max_tokens = min(4096, max(256, int(max_chars)))
 
     def fn(text: str, sender: str, chat: str,
            history: Optional[list] = None) -> Optional[str]:
         return _chat(base, key, model, system, text, sender, chat,
-                     timeout, history=history)
+                     timeout, history=history, max_tokens=max_tokens)
 
     return fn

@@ -42,8 +42,8 @@ class AutoReplyApp:
         self.accounts = {}
 
         root.title("微信自动回复")
-        root.geometry("900x720")
-        root.minsize(780, 560)
+        root.geometry("960x900")
+        root.minsize(820, 760)
         try:
             root.option_add("*Font", ("Microsoft YaHei UI", 10))
         except Exception:
@@ -108,9 +108,9 @@ class AutoReplyApp:
         self.dry_var = tk.BooleanVar(value=True)
         self.verify_var = tk.BooleanVar(value=False)
         self.mention_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row1, text="干跑（只打印，不发送）", variable=self.dry_var).pack(side="left", padx=6)
-        ttk.Checkbutton(row1, text="数据库回读确认（慢，可能误报）", variable=self.verify_var).pack(side="left", padx=6)
-        ttk.Checkbutton(row1, text="群里要求 @我", variable=self.mention_var).pack(side="left", padx=6)
+        ttk.Checkbutton(row1, text="干跑（不发送）", variable=self.dry_var).pack(side="left", padx=6)
+        ttk.Checkbutton(row1, text="回读确认（可能误报）", variable=self.verify_var).pack(side="left", padx=6)
+        ttk.Checkbutton(row1, text="群里@我", variable=self.mention_var).pack(side="left", padx=6)
         ttk.Label(row2, text="群触发前缀：").pack(side="left", padx=(6, 2))
         self.prefix_var = tk.StringVar(value="!")
         ttk.Entry(row2, textvariable=self.prefix_var, width=4).pack(side="left")
@@ -131,27 +131,72 @@ class AutoReplyApp:
         row4 = ttk.Frame(opts)
         row4.pack(fill="x", pady=(2, 0))
         ttk.Label(row4, foreground="#666",
-                  text="群聊触发：「!」开头或 @我/别名；私聊直接匹配规则。"
+                  text="群聊：「!」开头或 @我/别名；/new 或 重置对话 清空记忆。"
                   ).pack(side="left", padx=6)
 
         row5 = ttk.Frame(opts)
         row5.pack(fill="x", pady=(2, 0))
         self.ai_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row5, text="用 AI 回复（没有规则时就是纯 AI）",
+        ttk.Checkbutton(row5, text="用 AI 回复（无规则=纯 AI）",
                         variable=self.ai_var).pack(side="left", padx=6)
         ttk.Label(row5, foreground="#666",
-                  text="在 .env 填 WECHATAUTO_AI_KEY"
+                  text=".env 里配 WECHATAUTO_AI_KEY"
                   ).pack(side="left", padx=(4, 0))
 
-        row6 = ttk.Frame(opts)
-        row6.pack(fill="x", pady=(2, 0))
-        ttk.Label(row6, text="记忆轮数：").pack(side="left", padx=(6, 2))
-        self.memory_turns_var = tk.IntVar(value=10)
-        ttk.Spinbox(row6, from_=0, to=50, textvariable=self.memory_turns_var,
+        limits = ttk.LabelFrame(self.root, text="节奏与限制")
+        limits.pack(fill="x", **pad)
+
+        l1 = ttk.Frame(limits)
+        l1.pack(fill="x", padx=6, pady=(6, 2))
+        ttk.Label(l1, text="节奏：").pack(side="left")
+        self.rhythm_var = tk.StringVar(value="calm")
+        ttk.Combobox(l1, textvariable=self.rhythm_var, state="readonly", width=8,
+                     values=["calm", "natural", "fast"]).pack(side="left")
+        ttk.Label(l1, text="   写间隔：").pack(side="left")
+        self.gap_lo_var = tk.DoubleVar(value=6.0)
+        self.gap_hi_var = tk.DoubleVar(value=14.0)
+        ttk.Spinbox(l1, from_=0, to=600, increment=1, textvariable=self.gap_lo_var,
                     width=4).pack(side="left")
-        ttk.Label(row6, foreground="#666",
-                  text="（0=关闭；每个会话独立，默认 10 轮 / 3000 字）"
-                  ).pack(side="left", padx=(6, 0))
+        ttk.Label(l1, text="~").pack(side="left", padx=2)
+        ttk.Spinbox(l1, from_=0, to=600, increment=1, textvariable=self.gap_hi_var,
+                    width=4).pack(side="left")
+        ttk.Label(l1, text="秒   窗口：").pack(side="left")
+        self.window_var = tk.DoubleVar(value=300.0)
+        ttk.Spinbox(l1, from_=10, to=3600, increment=10, textvariable=self.window_var,
+                    width=5).pack(side="left")
+        ttk.Label(l1, text="秒").pack(side="left")
+
+        l2 = ttk.Frame(limits)
+        l2.pack(fill="x", padx=6, pady=2)
+        ttk.Label(l2, text="窗口内次数：").pack(side="left")
+        self.burst_var = tk.IntVar(value=3)
+        ttk.Spinbox(l2, from_=0, to=100, increment=1, textvariable=self.burst_var,
+                    width=4).pack(side="left")
+        ttk.Label(l2, text="   触发后冷却：").pack(side="left")
+        self.cool_lo_var = tk.DoubleVar(value=60.0)
+        self.cool_hi_var = tk.DoubleVar(value=150.0)
+        ttk.Spinbox(l2, from_=0, to=3600, increment=5, textvariable=self.cool_lo_var,
+                    width=4).pack(side="left")
+        ttk.Label(l2, text="~").pack(side="left", padx=2)
+        ttk.Spinbox(l2, from_=0, to=3600, increment=5, textvariable=self.cool_hi_var,
+                    width=4).pack(side="left")
+        ttk.Label(l2, text="秒").pack(side="left")
+
+        l3 = ttk.Frame(limits)
+        l3.pack(fill="x", padx=6, pady=(2, 6))
+        ttk.Label(l3, text="记忆轮数：").pack(side="left")
+        self.memory_turns_var = tk.IntVar(value=10)
+        ttk.Spinbox(l3, from_=0, to=50, increment=1, textvariable=self.memory_turns_var,
+                    width=4).pack(side="left")
+        ttk.Label(l3, text="   记忆字数：").pack(side="left")
+        self.memory_chars_var = tk.IntVar(value=3000)
+        ttk.Spinbox(l3, from_=200, to=20000, increment=200,
+                    textvariable=self.memory_chars_var, width=6).pack(side="left")
+        ttk.Label(l3, text="   单条上限：").pack(side="left")
+        self.max_reply_var = tk.IntVar(value=2000)
+        ttk.Spinbox(l3, from_=50, to=5000, increment=100,
+                    textvariable=self.max_reply_var, width=6).pack(side="left")
+        ttk.Label(l3, text="字").pack(side="left")
 
         ctrl = ttk.Frame(self.root)
         ctrl.pack(fill="x", **pad)
@@ -226,6 +271,15 @@ class AutoReplyApp:
                               if x.strip()],
             "ai": bool(self.ai_var.get()),
             "memory_turns": max(0, int(self.memory_turns_var.get())),
+            "memory_chars": max(200, int(self.memory_chars_var.get())),
+            "max_reply_chars": max(0, int(self.max_reply_var.get())),
+            "rhythm": self.rhythm_var.get(),
+            "gap": (max(0.0, float(self.gap_lo_var.get())),
+                    max(0.0, float(self.gap_hi_var.get()))),
+            "window": max(10.0, float(self.window_var.get())),
+            "burst": max(0, int(self.burst_var.get())),
+            "cooloff": (max(0.0, float(self.cool_lo_var.get())),
+                        max(0.0, float(self.cool_hi_var.get()))),
             "prefix": self.prefix_var.get(),
             "cooldown": max(0.0, float(self.cool_var.get())),
             "permin": max(1, int(self.permin_var.get())),
@@ -261,6 +315,17 @@ class AutoReplyApp:
             from wechatauto.param import WxParam
             WxParam.ENABLE_OCR = False
             self._log("OCR 兜底：关闭（UIA 打不开会话时会报错，不会盲点）")
+
+            from wechatauto import rhythm as rhythm_mod
+            rhythm_mod.set_profile(cfg["rhythm"])
+            rhythm_mod.configure(gap=tuple(cfg["gap"]), burst=cfg["burst"],
+                                 window=cfg["window"],
+                                 cooloff=tuple(cfg["cooloff"]))
+            rp = rhythm_mod.profile()
+            self._log("节奏：%s | 间隔 %.1f–%.1fs | %.0fs 内 %d 次 | 冷却 %.0f–%.0fs"
+                      % (rp.name, rp.gap[0], rp.gap[1], rp.window, rp.burst,
+                         rp.cooloff[0], rp.cooloff[1]))
+            self._log("单条回复上限：%d 字" % cfg["max_reply_chars"])
             self._log("加载账号数据库（首次可能需要 10–60 秒）…")
             db = WeChatDB(account=cfg["account"])
             info = db.get_self_info()
@@ -287,7 +352,7 @@ class AutoReplyApp:
             ai_fn = None
             if cfg["ai"]:
                 from wechatauto.ai_reply import make_reply_fn
-                ai_fn = make_reply_fn()
+                ai_fn = make_reply_fn(max_chars=cfg["max_reply_chars"])
                 if ai_fn is None:
                     self._log("已勾选 AI，但没读到 WECHATAUTO_AI_KEY，本次不使用 AI")
                 else:
@@ -299,15 +364,18 @@ class AutoReplyApp:
                     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                     "memory", "auto_reply_%s.json" % cfg["account"])
                 memory = ChatMemory(mem_path, max_turns=cfg["memory_turns"],
-                                    max_chars=3000)
-                self._log("会话记忆：每会话 %d 轮 / 3000 字" % cfg["memory_turns"])
+                                    max_chars=cfg["memory_chars"])
+                self._log("会话记忆：每会话 %d 轮 / %d 字"
+                          % (cfg["memory_turns"], cfg["memory_chars"]))
+                self._log("发送 /new 或 重置对话 可清空当前会话记忆")
             else:
                 self._log("会话记忆：关闭")
             replier = AutoReplier(db, rules, sender, self._log,
                                   cooldown=cfg["cooldown"],
                                   max_per_minute=cfg["permin"],
                                   mention_names=cfg["mention_names"],
-                                  ai_fn=ai_fn, memory=memory)
+                                  ai_fn=ai_fn, memory=memory,
+                                  max_reply_chars=cfg["max_reply_chars"])
             listener = Listener(db, interval=1.0)
 
             raw = [x.strip() for x in cfg["chats"].replace("，", ",").split(",") if x.strip()]

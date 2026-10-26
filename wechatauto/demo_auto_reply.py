@@ -342,6 +342,23 @@ def render_template(tpl: str, sender: str, chat: str, content: str) -> str:
                .replace("{time}", time.strftime("%H:%M")))
 
 
+# “开始新对话”命令：清空**当前会话**的记忆；群里需要带 ! 前缀（! /new 也行）
+RESET_COMMANDS = {
+    "/new", "/reset", "/重置对话", "/重置", "重置对话", "新对话", "开始新对话",
+}
+
+
+def is_reset_command(text: str) -> bool:
+    return (text or "").strip().casefold() in RESET_COMMANDS
+
+
+def cap_text(text: str, limit: int) -> str:
+    """按字符数截断（中文按 1 个字算）；``limit<=0`` 不截断。"""
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return text[:max(0, limit - 1)].rstrip() + "…"
+
+
 # ---------------------------------------------------------------------------
 # 发送线程
 # ---------------------------------------------------------------------------
@@ -429,7 +446,7 @@ class AutoReplier:
                  cooldown: float = 5.0, max_per_minute: int = 6,
                  max_age: float = 180.0, ignore=(), service_prefixes=(),
                  service_suffixes=(), mention_names=(), echo_self: bool = False,
-                 ai_fn=None, memory=None):
+                 ai_fn=None, memory=None, max_reply_chars: int = 2000):
         self.db = db
         self.rules = rules
         self.sender = sender
@@ -439,6 +456,7 @@ class AutoReplier:
         self.max_age = max_age
         self.ai_fn = ai_fn
         self.memory = memory
+        self.max_reply_chars = max(0, int(max_reply_chars))
         self.own_wxid = (db.get_self_info() or {}).get("username") or db.wxid or ""
         self.own_names = set(mention_names) | {self.own_wxid}
         try:
@@ -532,6 +550,18 @@ class AutoReplier:
         sender_name = self._sender_name(sender_wxid)
         chat_name = display_name_of(self.db, chat)
 
+        # 开始新对话：只清当前会话记忆，不调模型；回复也不写回记忆。
+        if is_reset_command(text_for_match):
+            if self.memory:
+                self.memory.clear(chat)
+                self.log("已清空会话记忆：%s" % chat_name)
+                msg = "好的，已开始新对话。"
+            else:
+                self.log("收到重置命令，但记忆未启用：%s" % chat_name)
+                msg = "记忆未启用。"
+            self.sender.submit(chat, chat_name, msg)
+            return
+
         matched = self.rules.match(text_for_match, chat)
         use_ai = matched is None and self.ai_fn is not None
         if not matched and not use_ai and not self.rules.default_reply:
@@ -549,6 +579,7 @@ class AutoReplier:
                          if is_group else text_for_match)
             ai_text = self.ai_fn(user_line, sender_name, chat_name, history)
             if ai_text:
+                ai_text = self._cap(ai_text)
                 if self.memory:
                     self.memory.add(chat, "user", user_line)
                     self.memory.add(chat, "assistant", ai_text)
@@ -563,9 +594,17 @@ class AutoReplier:
         if not reply:
             return
         reply = render_template(reply, sender_name, chat_name, text_for_match)
+        reply = self._cap(reply)
         self.log("命中：%s | %s: %s -> %s"
                  % (chat_name, sender_name, text_for_match[:40], reply[:60]))
         self.sender.submit(chat, chat_name, reply)
+
+    def _cap(self, text: str) -> str:
+        if self.max_reply_chars > 0 and len(text) > self.max_reply_chars:
+            self.log("回复超长（%d 字），截断到 %d 字"
+                     % (len(text), self.max_reply_chars))
+            return cap_text(text, self.max_reply_chars)
+        return text
 
     def _sender_name(self, wxid: str) -> str:
         try:
@@ -606,6 +645,25 @@ def self_test() -> int:
         else:
             print("ok  ", repr(text), "->", repr(got))
     print("self-test:", "PASS" if not bad else "%d FAILED" % bad)
+
+    # 重置命令识别
+    for cmd in ("/new", "/reset", "/重置对话", "重置对话", "开始新对话"):
+        if not is_reset_command(cmd):
+            bad += 1
+            print("FAIL reset command:", repr(cmd))
+    for cmd in ("/help", "新的对话", "重置"):
+        if is_reset_command(cmd):
+            bad += 1
+            print("FAIL reset command should not match:", repr(cmd))
+    # 长度截断
+    capped = cap_text("一" * 10, 5)
+    if capped != "一一一一…" or len(capped) != 5:
+        bad += 1
+        print("FAIL cap_text:", repr(capped))
+    if cap_text("短", 2000) != "短":
+        bad += 1
+        print("FAIL cap_text short")
+    print("self-test:", "PASS" if not bad else "%d FAILED" % bad)
     return 0 if not bad else 1
 
 
@@ -642,6 +700,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--memory-file", default="",
                    help="记忆文件路径（默认 memory/auto_reply_<账号>.json）")
     p.add_argument("--no-memory", action="store_true", help="关闭会话记忆")
+    p.add_argument("--max-reply-chars", type=int, default=2000,
+                   help="单条回复长度上限（字，0=不限）")
+    p.add_argument("--rhythm", choices=["calm", "natural", "fast"], default="calm",
+                   help="拟人节奏档位（默认 calm：6-14s 间隔 / 300s 内 3 次）")
+    p.add_argument("--rhythm-gap", nargs=2, type=float, metavar=("MIN", "MAX"),
+                   default=None, help="覆盖写动作最小间隔（秒）")
+    p.add_argument("--rhythm-burst", type=int, default=None,
+                   help="覆盖窗口内写动作上限")
+    p.add_argument("--rhythm-window", type=float, default=None,
+                   help="覆盖突发统计窗口（秒）")
+    p.add_argument("--rhythm-cooloff", nargs=2, type=float, metavar=("MIN", "MAX"),
+                   default=None, help="覆盖触发上限后的冷却（秒）")
     p.add_argument("--verify", dest="verify", action="store_true",
                    help="发送后回读数据库确认（默认关闭：微信落库可能晚于 8 秒，会误报）")
     p.add_argument("--no-verify", dest="verify", action="store_false",
@@ -667,6 +737,26 @@ def main(argv=None) -> int:
     from wechatauto.param import WxParam
     WxParam.ENABLE_OCR = bool(args.ocr)
     log("OCR 兜底：%s" % ("开启" if args.ocr else "关闭（默认，避免盲点）"))
+
+    # 拟人节奏：档位 + 可选的单项覆盖（GUI 里也是这几个数）
+    from wechatauto import rhythm as rhythm_mod
+    rhythm_mod.set_profile(args.rhythm)
+    over = {}
+    if args.rhythm_gap:
+        over["gap"] = tuple(args.rhythm_gap)
+    if args.rhythm_burst is not None:
+        over["burst"] = max(0, int(args.rhythm_burst))
+    if args.rhythm_window is not None:
+        over["window"] = max(10.0, float(args.rhythm_window))
+    if args.rhythm_cooloff:
+        over["cooloff"] = tuple(args.rhythm_cooloff)
+    if over:
+        rhythm_mod.configure(**over)
+    p = rhythm_mod.profile()
+    log("拟人节奏：%s | 间隔 %.1f-%.1fs | %.0fs 内 %d 次 | 冷却 %.0f-%.0fs"
+        % (p.name, p.gap[0], p.gap[1], p.window, p.burst,
+           p.cooloff[0], p.cooloff[1]))
+    log("单条回复上限：%d 字" % args.max_reply_chars)
 
     # 规则
     rules = RuleSet.from_json(args.rules) if args.rules else RuleSet()
@@ -700,6 +790,7 @@ def main(argv=None) -> int:
                             max_chars=args.memory_chars)
         log("会话记忆：每会话 %d 轮 / %d 字（%s）"
             % (args.memory_turns, args.memory_chars, mem_path))
+        log("发送 /new 或 重置对话 可清空当前会话记忆")
     else:
         log("会话记忆：关闭")
 
@@ -733,7 +824,7 @@ def main(argv=None) -> int:
     ai_fn = None
     if args.ai:
         from wechatauto.ai_reply import make_reply_fn
-        ai_fn = make_reply_fn()
+        ai_fn = make_reply_fn(max_chars=args.max_reply_chars)
         if ai_fn is None:
             log("已勾选 --ai，但没读到 WECHATAUTO_AI_KEY，本次不使用 AI")
         else:
@@ -748,6 +839,7 @@ def main(argv=None) -> int:
         mention_names=args.mention_name,
         ai_fn=ai_fn,
         memory=memory,
+        max_reply_chars=args.max_reply_chars,
     )
 
     listener = Listener(db, interval=max(0.2, args.interval))
